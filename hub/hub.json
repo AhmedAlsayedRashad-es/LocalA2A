@@ -1,0 +1,21 @@
+{
+  "port": 8765,
+  "bind": "0.0.0.0",
+  "admins": {
+    "ahmed": "vFkjFJj-AKAOMmP6u-dQoVkSZByFW-aQ"
+  },
+  "pcs": {
+    "DESKTOP-EJG6MVD": {
+      "token": "f1LeUkgpsdLFKdo2eaRRI2ZH9hVhIzKC",
+      "user": "ahmed_rashad",
+      "groups": [
+        "admins",
+        "test"
+      ]
+    }
+  },
+  "data_dir": "C:\\Users\\ahmed_rashad\\AppData\\Local\\TeamA2A\\hub",
+  "report_hour": 7,
+  "task_timeout_s": 3600,
+  "join_code": "47nlmFQGNhwf"
+}

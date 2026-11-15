@@ -1,0 +1,12 @@
+{
+  "name": "pc-a",
+  "port": 8765,
+  "token": "ced4b945f22afae0fb0df52e",
+  "codex_cmd": ["codex", "exec", "--skip-git-repo-check", "-"],
+  "workdir": ".",
+  "timeout_s": 600,
+  "peers": {
+    "pc-b": "http://192.168.1.50:8765"
+  }
+}
+
