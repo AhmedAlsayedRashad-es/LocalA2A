@@ -1,0 +1,11 @@
+{
+  "name": "pc-a",
+  "port": 8765,
+  "token": "CHANGE-ME-same-secret-on-both-pcs",
+  "codex_cmd": ["codex", "exec", "--skip-git-repo-check", "-"],
+  "workdir": ".",
+  "timeout_s": 600,
+  "peers": {
+    "pc-b": "http://192.168.1.50:8765"
+  }
+}

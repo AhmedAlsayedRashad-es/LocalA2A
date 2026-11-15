@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Team A2A Hub</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#1d2330;--mut:#667085;--line:#e4e7ec;--acc:#2f6fed;--ok:#12805c;--bad:#c4320a;--warn:#b54708}
+@media (prefers-color-scheme:dark){:root{--bg:#12151b;--card:#1a1f27;--fg:#e6e9ef;--mut:#98a2b3;--line:#2a313c;--acc:#6b9bff;--ok:#3ccb8f;--bad:#ff7a59;--warn:#f5b041}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,Segoe UI,sans-serif}
+header{display:flex;gap:16px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--card);flex-wrap:wrap}
+header h1{font-size:16px;margin:0}nav button{background:none;border:0;color:var(--mut);padding:6px 10px;cursor:pointer;font:inherit;border-radius:6px}
+nav button.on{color:var(--fg);background:var(--bg)}main{padding:16px;max-width:1200px;margin:auto}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:14px;overflow-x:auto}
+table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mut);font-weight:500;font-size:12px}tr.click{cursor:pointer}tr.click:hover{background:var(--bg)}
+.pill{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;border:1px solid var(--line)}
+.done,.online{color:var(--ok)}.failed,.offline{color:var(--bad)}.needs_input,.running,.pending{color:var(--warn)}.queued,.canceled{color:var(--mut)}
+textarea,input,select{width:100%;font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px}
+textarea{min-height:110px}button.go{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:8px 16px;font:inherit;cursor:pointer;margin-top:8px}
+pre{white-space:pre-wrap;word-break:break-word;margin:6px 0 0;font:13px/1.45 ui-monospace,Consolas,monospace}
+.msg{border-left:3px solid var(--acc);padding:6px 10px;margin:10px 0}.ans{border-left-color:var(--ok)}.mut{color:var(--mut);font-size:12px}
+#who{margin-left:auto;color:var(--mut);font-size:12px}.row{display:flex;gap:10px;flex-wrap:wrap}.row>*{flex:1;min-width:200px}
+</style>
+</head>
+<body>
+<header><h1>Team A2A Hub</h1>
+<nav id="nav"><button data-v="pcs" class="on">PCs</button><button data-v="threads">Threads</button><button data-v="send">Send</button><button data-v="report">Report</button><button data-v="audit">Audit</button></nav>
+<span id="who"></span></header>
+<main id="main"></main>
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let token = ''; try { token = localStorage.getItem('a2a_token') || ''; } catch (e) {}
+let view = 'pcs', openThread = null, isOwner = false;
+
+async function api(method, path, body) {
+  const r = await fetch(path, {method, headers: {'Content-Type': 'application/json', 'X-A2A-Token': token},
+                               body: body ? JSON.stringify(body) : undefined});
+  const j = await r.json().catch(() => ({ok: false, error: 'bad response'}));
+  if (r.status === 401) { login(); throw new Error('bad token'); }
+  if (!j.ok && j.ok !== undefined && !j.was) throw new Error(j.error || 'error');
+  return j;
+}
+function login() {
+  $('#main').innerHTML = `<div class="card"><b>Admin token</b><p class="mut">Make one on the hub PC: <code>python hub.py add-admin NAME</code></p>
+    <input id="tok" type="password" placeholder="paste the admin token"><button class="go" id="tokgo">Sign in</button></div>`;
+  $('#tokgo').onclick = () => { token = $('#tok').value.trim(); try { localStorage.setItem('a2a_token', token); } catch (e) {} render(); };
+}
+const pill = s => `<span class="pill ${esc(s)}">${esc(s)}</span>`;
+
+async function render() {
+  if (!token) return login();
+  try {
+    const w = await api('GET', '/api/whoami'); isOwner = !!w.owner;
+    $('#who').textContent = 'signed in as ' + w.admin + (w.owner ? ' (owner)' : '');
+    if (openThread) return renderThread(openThread);
+    await ({pcs: renderPcs, threads: renderThreads, send: renderSend, report: renderReport, audit: renderAudit})[view]();
+  } catch (e) { if (e.message !== 'bad token') $('#main').innerHTML = `<div class="card failed">${esc(e.message)}</div>`; }
+}
+async function renderPcs() {
+  if (document.activeElement && document.activeElement.dataset && document.activeElement.dataset.g) return;  // editing groups
+  const r = await api('GET', '/api/pcs');
+  const jc = isOwner ? (await api('GET', '/api/joincode')).join_code : null;
+  $('#main').innerHTML = `${isOwner ? `<div class="card row"><div><b>Join code</b> <span class="mut">(TeamA2A-Setup uses it; new PCs wait here for your approval)</span>
+  <pre id="jc">${esc(jc)}</pre></div><div style="flex:0"><button class="go" id="rot">New code</button></div></div>` : ''}
+  <div class="card"><table><tr><th>PC</th><th>Role</th><th>State</th><th>User</th><th>Groups</th><th>Busy</th><th>Queued</th><th>Last seen</th>${isOwner ? '<th></th>' : ''}</tr>
+  ${r.pcs.map(p => `<tr><td><b>${esc(p.name)}</b></td><td>${pill(p.approved ? p.role : 'pending')}</td><td>${pill(p.online ? 'online' : 'offline')}</td><td>${esc(p.user)}</td>
+  <td>${isOwner ? `<input data-g="${esc(p.name)}" value="${esc(p.groups.join(', '))}" style="min-width:120px">` : esc(p.groups.join(', '))}</td>
+  <td>${esc(p.busy_task || '')}</td><td>${p.queued}</td><td class="mut">${esc(p.last_seen || 'never')}</td>
+  ${isOwner ? `<td style="white-space:nowrap">${p.approved
+    ? `<button data-role="${p.role === 'admin' ? 'user' : 'admin'}" data-pc="${esc(p.name)}">${p.role === 'admin' ? 'Make user' : 'Make admin'}</button>
+       <button data-rm="${esc(p.name)}">Remove</button>`
+    : `<button data-ok="${esc(p.name)}">Approve</button> <button data-rm="${esc(p.name)}">Reject</button>`}</td>` : ''}</tr>`).join('')}
+  </table>${r.pcs.length ? '' : '<p class="mut">No PCs yet. Run TeamA2A-Setup.exe on a PC.</p>'}</div>`;
+  if (!isOwner) return;
+  $('#rot').onclick = async () => { if (confirm('Make a new join code? The old code stops working for new installs.')) { await api('POST', '/api/joincode', {}); render(); } };
+  document.querySelectorAll('button[data-role]').forEach(b => b.onclick = async () => {
+    await api('POST', `/api/pcs/${encodeURIComponent(b.dataset.pc)}/role`, {role: b.dataset.role}); render(); });
+  document.querySelectorAll('button[data-ok]').forEach(b => b.onclick = async () => {
+    await api('POST', `/api/pcs/${encodeURIComponent(b.dataset.ok)}/approve`, {}); render(); });
+  document.querySelectorAll('button[data-rm]').forEach(b => b.onclick = async () => {
+    if (confirm(`Remove ${b.dataset.rm} from the hub? Its token stops working.`)) { await api('POST', `/api/pcs/${encodeURIComponent(b.dataset.rm)}/remove`, {}); render(); } });
+  document.querySelectorAll('input[data-g]').forEach(i => i.onchange = async () => {
+    await api('POST', `/api/pcs/${encodeURIComponent(i.dataset.g)}/groups`, {groups: i.value}); i.blur(); render(); });
+}
+async function renderThreads() {
+  const r = await api('GET', '/api/threads?limit=100');
+  $('#main').innerHTML = `<div class="card"><table><tr><th>Updated</th><th>PC</th><th>Status</th><th>Title</th><th>Admin</th></tr>
+  ${r.threads.map(t => `<tr class="click" data-c="${esc(t.context_id)}"><td class="mut">${esc(t.updated)}</td><td>${esc(t.pc)}</td>
+  <td>${pill(t.status)}</td><td>${esc(t.title)}</td><td>${esc(t.admin)}</td></tr>`).join('')}</table></div>`;
+  document.querySelectorAll('tr[data-c]').forEach(tr => tr.onclick = () => { openThread = tr.dataset.c; render(); });
+}
+async function renderThread(cid) {
+  const th = await api('GET', '/api/threads/' + cid);
+  const draft = $('#reply') ? $('#reply').value : '';
+  $('#main').innerHTML = `<div class="card"><button class="go" id="back">← Threads</button>
+  <h3>${esc(th.title)}</h3><p class="mut">PC ${esc(th.pc)} · thread ${esc(th.context_id)} · started ${esc(th.created)} by ${esc(th.admin)}</p>
+  ${th.turns.map(t => `<div class="msg"><span class="mut">${esc(t.admin)} · ${esc(t.created)}</span><pre>${esc(t.message)}</pre></div>
+  <div class="msg ans"><span class="mut">${esc(th.pc)} · ${pill(t.status)} ${esc(t.finished || '')}
+  ${['queued', 'running'].includes(t.status) ? `<button data-x="${esc(t.task_id)}">cancel</button>` : ''}</span>
+  <pre>${esc(t.output || t.error || '(no answer yet)')}</pre></div>`).join('')}
+  <textarea id="reply" placeholder="Reply in this thread">${esc(draft)}</textarea><button class="go" id="send">Send reply</button></div>`;
+  $('#back').onclick = () => { openThread = null; view = 'threads'; render(); };
+  $('#send').onclick = async () => { const m = $('#reply').value.trim(); if (!m) return;
+    await api('POST', '/api/send', {message: m, context_id: cid}); $('#reply').value = ''; render(); };
+  document.querySelectorAll('button[data-x]').forEach(b => b.onclick = async () => { await api('POST', `/api/tasks/${b.dataset.x}/cancel`, {}); render(); });
+}
+async function renderSend() {
+  if ($('#msg')) return;  // keep the form while auto refresh runs
+  const r = await api('GET', '/api/pcs');
+  const opts = ['all', ...r.groups.map(g => 'group:' + g), ...r.pcs.map(p => p.name)];
+  $('#main').innerHTML = `<div class="card"><div class="row"><div><label class="mut">To</label>
+  <select id="to">${opts.map(o => `<option>${esc(o)}</option>`).join('')}</select></div>
+  <div><label class="mut">Title (optional)</label><input id="title"></div></div>
+  <label class="mut">Request (the remote Claude runs it with full permissions, nobody at the PC)</label>
+  <textarea id="msg"></textarea><button class="go" id="go">Send</button><div id="res"></div></div>`;
+  $('#go').onclick = async () => { const m = $('#msg').value.trim(); if (!m) return;
+    const j = await api('POST', '/api/send', {to: $('#to').value, message: m, title: $('#title').value || undefined});
+    $('#msg').value = ''; $('#res').innerHTML = `<p class="mut">Sent ${j.tasks.length} task(s). See Threads.</p>`; };
+}
+async function renderReport() {
+  const r = await api('GET', '/api/report?since_hours=16');
+  $('#main').innerHTML = `<div class="card"><pre>${esc(r.markdown)}</pre></div>`;
+}
+async function renderAudit() {
+  const r = await api('GET', '/api/audit?limit=200');
+  $('#main').innerHTML = `<div class="card"><table><tr><th>Time</th><th>Actor</th><th>Event</th><th>Detail</th></tr>
+  ${r.audit.map(a => `<tr><td class="mut">${esc(a.ts)}</td><td>${esc(a.actor)}</td><td>${esc(a.event)}</td>
+  <td><pre>${esc(JSON.stringify(a.detail).slice(0, 400))}</pre></td></tr>`).join('')}</table></div>`;
+}
+$('#nav').onclick = e => { const v = e.target.dataset.v; if (!v) return; view = v; openThread = null;
+  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.v === v)); $('#main').innerHTML = ''; render(); };
+setInterval(() => { if (view !== 'send' && !(document.activeElement && document.activeElement.id === 'reply')) render(); }, 10000);
+render();
+</script>
+</body>
+</html>

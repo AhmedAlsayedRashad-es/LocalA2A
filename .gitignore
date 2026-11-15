@@ -1,0 +1,16 @@
+# Build output
+build/work/
+build/.venv/
+dist/
+
+# Local config with live tokens (use the *.example.json files)
+config.json
+receiver/receiver.json
+hub/hub.json
+
+# Runtime data and logs
+hub/data/
+logs/
+receiver/logs/
+__pycache__/
+*.pyc

@@ -1,0 +1,8 @@
+{
+  "name": "PC-NAME",
+  "hub_url": "http://HUB-IP:8765",
+  "token": "made-by: python hub.py add-pc PC-NAME",
+  "workdir": "",
+  "claude_cmd": ["claude", "-p", "--output-format", "json", "--dangerously-skip-permissions"],
+  "extra_system_prompt": ""
+}
