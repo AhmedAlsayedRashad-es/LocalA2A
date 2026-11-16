@@ -77,6 +77,10 @@ def load_config(path=None):
     cfg.setdefault("heartbeat_s", 10)
     cfg.setdefault("poll_wait_s", 20)
     cfg.setdefault("extra_system_prompt", "")
+    # Plan limits (5-hour / weekly): read from every task; when idle and the last reading is older
+    # than this, a one-line Haiku prompt reads them again. 0 = no probe.
+    cfg.setdefault("usage_probe_s", 1800)
+    cfg.setdefault("usage_probe_model", "haiku")
     cfg.setdefault("mcp_cmd", None)  # [exe, args...] of the admin MCP; set by the installer
     # Direct file transfer: a small file server on direct_port. The installer turns it on after it
     # made the firewall rule; without the rule other PCs cannot reach it (they use the hub relay).
@@ -168,6 +172,57 @@ def send_file(cfg, to, path):
     return {**r, "mode": "hub"}
 
 
+def stream_cmd(cmd):
+    """`--output-format json` -> `stream-json --verbose`: the stream also has the rate_limit_event
+    line (plan limits). Its last line is the same result object. Other commands stay as they are."""
+    cmd = list(cmd)
+    for i in range(len(cmd) - 1):
+        if cmd[i] == "--output-format" and cmd[i + 1] == "json":
+            cmd[i + 1] = "stream-json"
+            if "--verbose" not in cmd:
+                cmd.append("--verbose")
+            break
+    return cmd
+
+
+def parse_limits(text, source):
+    """The plan limits from the last rate_limit_event line in claude's stream-json output, or None.
+    {'windows': {'five_hour': {'pct': 10, 'resets_at': epoch, 'status': 'allowed'}, ...},
+     'status': ..., 'at': epoch, 'source': 'task'|'probe'}"""
+    info = None
+    for line in (text or "").splitlines():
+        if '"rate_limit_event"' not in line:
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(ev, dict) and ev.get("type") == "rate_limit_event"
+                and isinstance(ev.get("rate_limit_info"), dict)):
+            info = ev["rate_limit_info"]
+    if not info:
+        return None
+    wins = info.get("unifiedWindows")
+    if not isinstance(wins, dict) or not wins:  # older CLI: one window per event
+        wins = {info["rateLimitType"]: info} if info.get("rateLimitType") else {}
+    out = {}
+    for name, w in list(wins.items())[:8]:
+        if not isinstance(w, dict):
+            continue
+        try:
+            pct = round(float(w.get("utilization")) * 100)
+        except (TypeError, ValueError):
+            continue
+        resets = w.get("resetsAt")
+        out[str(name)[:40]] = {"pct": pct,
+                               "resets_at": resets if isinstance(resets, (int, float)) else None,
+                               "status": str(w.get("status") or "")[:20]}
+    if not out:
+        return None
+    return {"windows": out, "status": str(info.get("status") or "")[:20], "at": time.time(),
+            "source": source}
+
+
 def unique_path(folder, name):
     """folder/name, or 'name (2).ext', 'name (3).ext' ... when it exists."""
     stem, ext = os.path.splitext(name)
@@ -181,7 +236,11 @@ class Receiver:
     def __init__(self, cfg):
         self.cfg = cfg
         self.version = VERSION
-        self.info = {"host": socket.gethostname(), "user": getpass.getuser(), "version": self.version}
+        # "limits" is in the dict from the start: other threads copy it while tasks update it.
+        self.info = {"host": socket.gethostname(), "user": getpass.getuser(), "version": self.version,
+                     "limits": None}
+        self.limits_at = 0.0  # when the last limits were read (task or probe)
+        self.probe_at = 0.0  # when the last probe ran, ok or not
         self.stop = threading.Event()
         self.role = None  # last role applied on this PC ("user" / "admin")
         self.max_parallel = max(1, int(cfg.get("max_parallel", 3)))
@@ -282,7 +341,7 @@ class Receiver:
         return f'"{sys.executable}" "{os.path.join(HERE, "receiver.py")}"'
 
     def build_cmd(self, task, resume):
-        cmd = list(self.cfg["claude_cmd"])
+        cmd = stream_cmd(self.cfg["claude_cmd"])
         exe = shutil.which(cmd[0])
         if not exe:
             raise RuntimeError(f"'{cmd[0]}' not found on PATH")
@@ -367,6 +426,7 @@ class Receiver:
             out = f.read().decode("utf-8", "replace").strip()
         with open(base + ".err", "rb") as f:
             err = f.read().decode("utf-8", "replace").strip()
+        self.note_limits(out, "task")
         for ext in (".in", ".out", ".err", ".sp.txt"):
             try:
                 os.unlink(base + ext)
@@ -675,6 +735,65 @@ class Receiver:
         except OSError:
             pass
 
+    # ---- plan limits (5-hour / weekly), sent to the hub with the next poll
+    def note_limits(self, out, source):
+        lim = parse_limits(out, source)
+        if lim:
+            self.info["limits"] = lim
+            self.limits_at = lim["at"]
+        return lim
+
+    def run_probe(self):
+        """One short Haiku prompt, only to read the rate_limit_event. Return the limits or None."""
+        cmd = stream_cmd(self.cfg["claude_cmd"])
+        exe = shutil.which(cmd[0])
+        if not exe:
+            raise RuntimeError(f"'{cmd[0]}' not found on PATH")
+        cmd[0] = exe
+        cmd += ["--model", self.cfg["usage_probe_model"], "--max-turns", "1",
+                "--no-session-persistence", "--strict-mcp-config", "--disable-slash-commands"]
+        env = {k: v for k, v in os.environ.items() if k not in STRIP_ENV}
+        env["A2A_IN_TASK"] = "1"
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        d = os.path.join(LOG_DIR, "probe")
+        os.makedirs(d, exist_ok=True)
+        base = os.path.join(d, "probe")
+        with open(base + ".in", "wb") as f:
+            f.write(b"Reply with OK.")
+        with open(base + ".in", "rb") as fin, open(base + ".out", "wb") as fout, \
+                open(base + ".err", "wb") as ferr:
+            p = subprocess.Popen(cmd, stdin=fin, stdout=fout, stderr=ferr, cwd=d, env=env,
+                                 creationflags=flags)
+            try:
+                p.wait(120)
+            except subprocess.TimeoutExpired:
+                self.kill_tree(p)
+                raise RuntimeError("probe timeout after 120 s")
+        with open(base + ".out", "rb") as f:
+            out = f.read().decode("utf-8", "replace")
+        lim = self.note_limits(out, "probe")
+        if not lim:
+            with open(base + ".err", "rb") as f:
+                err = f.read().decode("utf-8", "replace").strip()
+            raise RuntimeError(f"no rate_limit_event (exit {p.returncode}): {(err or out)[-500:]}")
+        return lim
+
+    def probe_loop(self):
+        every = float(self.cfg["usage_probe_s"])
+        while not self.stop.wait(min(60.0, every)):
+            with self.run_lock:
+                busy = bool(self.running)
+            if busy or self.updating.is_set():
+                continue
+            if time.time() - max(self.limits_at, self.probe_at) < every:
+                continue
+            self.probe_at = time.time()  # also after a failure: wait a full interval
+            try:
+                lim = self.run_probe()
+                log({"event": "usage_probe", "windows": lim["windows"]})
+            except Exception as e:
+                log({"event": "usage_probe_error", "error": f"{type(e).__name__}: {e}"})
+
     def update_loop(self):
         every = float(self.cfg.get("update_check_s", 3600))
         while not self.stop.is_set():
@@ -717,6 +836,8 @@ class Receiver:
         if self.cfg.get("auto_update", True):
             self.clean_old_files()
             threading.Thread(target=self.update_loop, daemon=True).start()
+        if float(self.cfg.get("usage_probe_s") or 0) > 0:
+            threading.Thread(target=self.probe_loop, daemon=True).start()
         delay = 2
         while not self.stop.is_set():
             try:

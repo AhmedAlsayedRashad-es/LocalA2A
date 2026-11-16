@@ -100,6 +100,46 @@ def t_list_pcs(a):
     return "\n".join(lines)
 
 
+def _span(seconds):
+    s = max(0, int(seconds))
+    d, h, m = s // 86400, s % 86400 // 3600, s % 3600 // 60
+    return f"{d}d {h}h" if d else f"{h}h {m}m" if h else f"{m}m"
+
+
+def _window_label(name):
+    return name.replace("five_hour", "5h").replace("seven_day", "week").replace("_", " ")
+
+
+def fmt_limits(lim, t=None):
+    """'5h 10% (resets in 2h 19m) | week 2% (resets in 6d 13h) | data 12m old, from probe'."""
+    t = time.time() if t is None else t
+    if not lim or not isinstance(lim.get("windows"), dict):
+        return "no data yet (old receiver, or no task or probe since it started)"
+    order = {"five_hour": 0, "seven_day": 1}
+    parts = []
+    for name, w in sorted(lim["windows"].items(), key=lambda kv: (order.get(kv[0], 2), kv[0])):
+        s = f"{_window_label(name)} {w.get('pct')}%"
+        if w.get("resets_at"):
+            s += " (reset now)" if w["resets_at"] <= t else f" (resets in {_span(w['resets_at'] - t)})"
+        if w.get("status") and w["status"] != "allowed":
+            s += f" [{w['status']}]"
+        parts.append(s)
+    age = t - float(lim.get("at") or 0)
+    tail = f"data {_span(age)} old, from {lim.get('source') or '?'}"
+    if age > 3600:
+        tail += " (OLD)"
+    return " | ".join(parts + [tail])
+
+
+def t_team_usage(a):
+    r = hub("GET", "/api/pcs")
+    if not r["pcs"]:
+        return "No PCs."
+    t = time.time()
+    return "\n".join(f"- {p['name']} ({p['user'] or '?'}, {'online' if p['online'] else 'offline'}): "
+                     + fmt_limits(p.get("limits"), t) for p in r["pcs"])
+
+
 def t_send(a):
     body = {"message": a.get("message"), "to": a.get("to"), "context_id": a.get("context_id"),
             "title": a.get("title")}
@@ -470,6 +510,11 @@ def t_list_transfers(a):
 TOOLS = [
     {"name": "list_pcs", "fn": t_list_pcs,
      "description": "List colleague PCs on the Team A2A hub: online or offline, busy, queued tasks, groups.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "team_usage", "fn": t_team_usage,
+     "description": ("Claude plan usage of each colleague PC's user: percent used of the 5-hour limit and "
+                     "the weekly limit, and when each resets. Read from that PC's last task, or a small "
+                     "probe every 30 minutes when the PC is idle."),
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "send", "fn": t_send,
      "description": ("Send a request to the Claude Code agent on one or more colleague PCs. It runs there "

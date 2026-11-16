@@ -47,6 +47,14 @@ ROLES = ("user", "admin")
 ONLINE_S = 90
 POLL_WAIT_S = 20
 FINAL = ("done", "failed", "canceled", "needs_input")
+MAX_LIMITS_JSON = 4096  # plan limits a receiver reports (5-hour / weekly windows)
+
+
+def _load_limits(text):
+    try:
+        return json.loads(text) if text else None
+    except ValueError:
+        return None
 
 
 def now():
@@ -160,7 +168,8 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(pcs_seen)").fetchall()}
-        for col, typ in (("ip", "TEXT"), ("direct_port", "INTEGER")):  # hub.db from an older version
+        for col, typ in (("ip", "TEXT"), ("direct_port", "INTEGER"),  # hub.db from an older version
+                         ("limits", "TEXT")):
             if col not in cols:
                 self.db.execute(f"ALTER TABLE pcs_seen ADD COLUMN {col} {typ}")
         self.db.commit()
@@ -365,6 +374,7 @@ class Hub:
                 "queued": queued.get(name, 0), "version": s.get("version"),
                 "role": pc.get("role", "user"), "approved": pc.get("approved", True),
                 "ip": s.get("ip"), "direct_port": s.get("direct_port") or 0,
+                "limits": _load_limits(s.get("limits")),
             })
         return out
 
@@ -435,18 +445,24 @@ class Hub:
         return {"broadcast_id": broadcast_id, "tasks": created}
 
     # ---- worker side
-    def seen(self, pc, busy_task=None, host=None, user=None, version=None, ip=None, direct_port=None):
+    def seen(self, pc, busy_task=None, host=None, user=None, version=None, ip=None, direct_port=None,
+             limits=None):
         if direct_port is not None:
             try:
                 direct_port = max(0, min(65535, int(direct_port)))
             except (TypeError, ValueError):
                 direct_port = None
-        self.store.x("INSERT INTO pcs_seen(pc,last_seen,busy_task,host,user,version,ip,direct_port) "
-                     "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(pc) DO UPDATE SET last_seen=excluded.last_seen,"
+        # Plan limits from the receiver: a small dict, else ignored (the last good value stays).
+        lim = json.dumps(limits) if isinstance(limits, dict) else None
+        if lim and (len(lim) > MAX_LIMITS_JSON or not isinstance(limits.get("windows"), dict)):
+            lim = None
+        self.store.x("INSERT INTO pcs_seen(pc,last_seen,busy_task,host,user,version,ip,direct_port,limits) "
+                     "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(pc) DO UPDATE SET last_seen=excluded.last_seen,"
                      " busy_task=excluded.busy_task, host=COALESCE(excluded.host,host),"
                      " user=COALESCE(excluded.user,user), version=COALESCE(excluded.version,version),"
-                     " ip=COALESCE(excluded.ip,ip), direct_port=COALESCE(excluded.direct_port,direct_port)",
-                     (pc, now(), busy_task, host, user, version, ip, direct_port))
+                     " ip=COALESCE(excluded.ip,ip), direct_port=COALESCE(excluded.direct_port,direct_port),"
+                     " limits=COALESCE(excluded.limits,limits)",
+                     (pc, now(), busy_task, host, user, version, ip, direct_port, lim))
 
     def _claim(self, pc, slots=None, running=None):
         """Give the PC up to `slots` queued tasks (old receivers: running=None, at most 1).
@@ -1206,7 +1222,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not pc:
                     return
                 body = self._body() if method == "POST" else {}
-                info = {k: body.get(k) for k in ("host", "user", "version", "direct_port")}
+                info = {k: body.get(k) for k in ("host", "user", "version", "direct_port", "limits")}
                 info["ip"] = self.client_address[0]
                 if p == "/api/worker/next" and method == "POST":
                     wait = min(float(body.get("wait", POLL_WAIT_S)), 60)

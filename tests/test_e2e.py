@@ -373,7 +373,7 @@ class E2E(unittest.TestCase):
             names = {t["name"] for t in rpc(2, "tools/list")["result"]["tools"]}
             self.assertEqual(names, {"list_pcs", "send", "get_thread", "get_broadcast", "list_tasks",
                                      "morning_report", "cancel", "send_file", "fetch_file",
-                                     "list_transfers", "ssh_run"})
+                                     "list_transfers", "ssh_run", "team_usage"})
             txt = rpc(3, "tools/call", {"name": "list_pcs", "arguments": {}})["result"]["content"][0]["text"]
             self.assertIn("pc1: ONLINE", txt)
             res = rpc(4, "tools/call", {"name": "send", "arguments": {

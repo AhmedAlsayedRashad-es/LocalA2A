@@ -58,16 +58,25 @@ async function render() {
     await ({pcs: renderPcs, threads: renderThreads, send: renderSend, report: renderReport, audit: renderAudit})[view]();
   } catch (e) { if (e.message !== 'bad token') $('#main').innerHTML = `<div class="card failed">${esc(e.message)}</div>`; }
 }
+function limitsCell(l) {
+  if (!l || !l.windows) return '<td class="mut">no data</td>';
+  const w = l.windows, f = x => x ? x.pct + '%' : '?';
+  const when = s => s ? new Date(s * 1000).toLocaleString() : '?';
+  const tip = Object.entries(w).map(([k, x]) => `${k}: ${x.pct}%, resets ${when(x.resets_at)}`).join('\n')
+    + `\nread ${when(l.at)} from ${l.source || '?'}`;
+  const old = Date.now() / 1000 - (l.at || 0) > 3600;
+  return `<td title="${esc(tip)}"${old ? ' class="mut"' : ''}>5h ${f(w.five_hour)} · wk ${f(w.seven_day)}</td>`;
+}
 async function renderPcs() {
   if (document.activeElement && document.activeElement.dataset && document.activeElement.dataset.g) return;  // editing groups
   const r = await api('GET', '/api/pcs');
   const jc = isOwner ? (await api('GET', '/api/joincode')).join_code : null;
   $('#main').innerHTML = `${isOwner ? `<div class="card row"><div><b>Join code</b> <span class="mut">(TeamA2A-Setup uses it; new PCs wait here for your approval)</span>
   <pre id="jc">${esc(jc)}</pre></div><div style="flex:0"><button class="go" id="rot">New code</button></div></div>` : ''}
-  <div class="card"><table><tr><th>PC</th><th>Role</th><th>State</th><th>User</th><th>Groups</th><th>Busy</th><th>Queued</th><th>Last seen</th>${isOwner ? '<th></th>' : ''}</tr>
+  <div class="card"><table><tr><th>PC</th><th>Role</th><th>State</th><th>User</th><th>Groups</th><th>Busy</th><th>Queued</th><th>Claude limits</th><th>Last seen</th>${isOwner ? '<th></th>' : ''}</tr>
   ${r.pcs.map(p => `<tr><td><b>${esc(p.name)}</b></td><td>${pill(p.approved ? p.role : 'pending')}</td><td>${pill(p.online ? 'online' : 'offline')}</td><td>${esc(p.user)}</td>
   <td>${isOwner ? `<input data-g="${esc(p.name)}" value="${esc(p.groups.join(', '))}" style="min-width:120px">` : esc(p.groups.join(', '))}</td>
-  <td>${esc(p.busy_task || '')}${p.running > 1 ? ' (+' + (p.running - 1) + ')' : ''}</td><td>${p.queued}</td><td class="mut">${esc(p.last_seen || 'never')}</td>
+  <td>${esc(p.busy_task || '')}${p.running > 1 ? ' (+' + (p.running - 1) + ')' : ''}</td><td>${p.queued}</td>${limitsCell(p.limits)}<td class="mut">${esc(p.last_seen || 'never')}</td>
   ${isOwner ? `<td style="white-space:nowrap">${p.approved
     ? `<button data-role="${p.role === 'admin' ? 'user' : 'admin'}" data-pc="${esc(p.name)}">${p.role === 'admin' ? 'Make user' : 'Make admin'}</button>
        <button data-rm="${esc(p.name)}">Remove</button>`
