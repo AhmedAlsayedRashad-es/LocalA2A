@@ -19,10 +19,12 @@ BIN = os.path.join(WORK, "bin")
 DIST = os.path.join(ROOT, "dist")
 
 
-def pyinstaller(script, name, console=False, data=()):
+def pyinstaller(script, name, console=False, data=(), paths=()):
     cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile",
            "--console" if console else "--noconsole", "--name", name,
            "--distpath", BIN, "--workpath", os.path.join(WORK, "tmp"), "--specpath", os.path.join(WORK, "spec")]
+    for p in paths:  # extra import folders (the hub imports a2a_sign / a2a_util from receiver\)
+        cmd += ["--paths", p]
     for src, dst in data:
         cmd += ["--add-data", f"{src}{os.pathsep}{dst}"]
     cmd.append(script)
@@ -53,16 +55,21 @@ def main():
     pyinstaller(os.path.join(ROOT, "receiver", "receiver.py"), "TeamA2A-Agent")
     pyinstaller(os.path.join(ROOT, "admin_mcp", "admin_mcp.py"), "TeamA2A-MCP", console=True)
     pyinstaller(os.path.join(ROOT, "hub", "hub.py"), "TeamA2A-Hub",
-                data=[(os.path.join(ROOT, "hub", "dashboard.html"), ".")])
+                data=[(os.path.join(ROOT, "hub", "dashboard.html"), ".")],
+                paths=[os.path.join(ROOT, "receiver")])
     setup = pyinstaller(os.path.join(ROOT, "client", "setup.py"), "TeamA2A-Setup",
                         data=[(os.path.join(BIN, "TeamA2A-Agent.exe"), "bin"),
                               (os.path.join(BIN, "TeamA2A-MCP.exe"), "bin"), (defaults, ".")])
+    # Console exe for SSH (setup_ssh.ps1 copies it to %ProgramData%\TeamA2A\ssh): sshd needs its output.
+    ssh_exe = pyinstaller(os.path.join(ROOT, "receiver", "a2a_ssh.py"), "TeamA2A-SSH", console=True)
+    shutil.copy2(os.path.join(ROOT, "receiver", "setup_ssh.ps1"), DIST)
     hub_setup = pyinstaller(os.path.join(ROOT, "client", "hub_setup.py"), "TeamA2A-Hub-Setup",
                             data=[(os.path.join(BIN, "TeamA2A-Hub.exe"), "bin")])
-    for exe in (setup, hub_setup):
+    for exe in (setup, hub_setup, ssh_exe):
         shutil.copy2(exe, DIST)
     print(f"\nDone: {DIST}\n  TeamA2A-Setup.exe      hub {a.hub_url}, join code built in\n"
-          "  TeamA2A-Hub-Setup.exe  for the hub PC")
+          "  TeamA2A-Hub-Setup.exe  for the hub PC\n"
+          "  TeamA2A-SSH.exe + setup_ssh.ps1  for IT, to turn on SSH on a PC")
 
 
 if __name__ == "__main__":

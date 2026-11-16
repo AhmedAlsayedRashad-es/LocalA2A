@@ -5,6 +5,7 @@ Add a PC:       python hub.py add-pc PC-NAME --groups revit,cad --hub-url http:/
 Add an admin:   python hub.py add-admin NAME
 Update key:     python hub.py update-key            (public key the receivers pin)
 Release:        python hub.py release --version 1.3 [--source ../receiver]
+SSH:            python hub.py ssh-add-key ADMIN "ssh-ed25519 AAAA..."   ssh-remove-key ADMIN   ssh-cidr 192.168.1.0/24
 Python 3.8+, standard library only (plus receiver/a2a_sign.py and receiver/a2a_util.py).
 """
 import argparse
@@ -37,6 +38,7 @@ for _p in (HERE, os.path.join(os.path.dirname(HERE), "receiver")):
     if _p not in sys.path:
         sys.path.append(_p)
 import a2a_sign  # noqa: E402
+import a2a_ssh  # noqa: E402
 from a2a_util import canonical, safe_name, version_tuple  # noqa: E402
 ROLES = ("user", "admin")
 
@@ -71,6 +73,8 @@ def load_config(path=None):
     cfg.setdefault("data_dir", "data")
     cfg.setdefault("report_hour", 7)
     cfg.setdefault("task_timeout_s", 3600)
+    cfg.setdefault("ssh_keys", {})  # admin name -> OpenSSH public key
+    cfg.setdefault("ssh_allowed_cidr", "")  # network the PCs accept SSH from (the admins' LAN)
     if not cfg.get("join_code"):
         cfg["join_code"] = secrets.token_urlsafe(9)
         save_config(cfg, path)
@@ -154,6 +158,10 @@ class Store:
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(pcs_seen)").fetchall()}
+        if "ip" not in cols:  # hub.db from before the SSH feature
+            self.db.execute("ALTER TABLE pcs_seen ADD COLUMN ip TEXT")
+            self.db.commit()
         self.lock = threading.RLock()
         self.cond = threading.Condition(self.lock)
         self.audit_path = os.path.join(data_dir, "audit.jsonl")
@@ -215,12 +223,18 @@ class Hub:
                         print(f"hub.json is not valid, the old config stays: {e}", flush=True)
                         self.store.audit("hub", "config_error", {"error": str(e)})
                     return
-                self.cfg["admins"], self.cfg["pcs"] = fresh["admins"], fresh["pcs"]
-                self.cfg["join_code"] = fresh["join_code"]
+                self._take(fresh)
                 if getattr(self, "_cfg_mtime", None) is not None:
                     self.store.audit("hub", "config_reload", {"pcs": len(fresh["pcs"]),
                                                               "admins": len(fresh["admins"])})
                 self._cfg_mtime = m
+
+    LIVE_KEYS = ("admins", "pcs", "join_code", "ssh_keys", "ssh_allowed_cidr")
+
+    def _take(self, fresh):
+        """Use the parts of a freshly read hub.json that may change while the hub runs."""
+        for k in self.LIVE_KEYS:
+            self.cfg[k] = fresh[k]
 
     def mutate(self, fn):
         """Read hub.json from disk, apply fn(cfg), write it, and use the result.
@@ -230,8 +244,7 @@ class Hub:
             fresh = load_config(self.cfg["_path"])
             result = fn(fresh)
             save_config(fresh)
-            self.cfg["admins"], self.cfg["pcs"] = fresh["admins"], fresh["pcs"]
-            self.cfg["join_code"] = fresh["join_code"]
+            self._take(fresh)
             self._cfg_mtime = os.path.getmtime(self.cfg["_path"])
             return result
 
@@ -416,12 +429,13 @@ class Hub:
         return {"broadcast_id": broadcast_id, "tasks": created}
 
     # ---- worker side
-    def seen(self, pc, busy_task=None, host=None, user=None, version=None):
-        self.store.x("INSERT INTO pcs_seen(pc,last_seen,busy_task,host,user,version) "
-                     "VALUES(?,?,?,?,?,?) ON CONFLICT(pc) DO UPDATE SET last_seen=excluded.last_seen,"
+    def seen(self, pc, busy_task=None, host=None, user=None, version=None, ip=None):
+        self.store.x("INSERT INTO pcs_seen(pc,last_seen,busy_task,host,user,version,ip) "
+                     "VALUES(?,?,?,?,?,?,?) ON CONFLICT(pc) DO UPDATE SET last_seen=excluded.last_seen,"
                      " busy_task=excluded.busy_task, host=COALESCE(excluded.host,host),"
-                     " user=COALESCE(excluded.user,user), version=COALESCE(excluded.version,version)",
-                     (pc, now(), busy_task, host, user, version))
+                     " user=COALESCE(excluded.user,user), version=COALESCE(excluded.version,version),"
+                     " ip=COALESCE(excluded.ip,ip)",
+                     (pc, now(), busy_task, host, user, version, ip))
 
     def _claim(self, pc, slots=None, running=None):
         """Give the PC up to `slots` queued tasks (old receivers: running=None, at most 1).
@@ -828,6 +842,61 @@ class Hub:
             raise LookupError(f"no release {version}")
         return path
 
+    # ---- SSH (key-only, forced command on the PC; see receiver/a2a_ssh.py)
+    def admin_names(self):
+        """Hub admins: the admin tokens plus PCs promoted to admin."""
+        return set(self.cfg["admins"]) | {n for n, pc in self.cfg["pcs"].items()
+                                          if pc.get("approved", True) and pc.get("role") == "admin"}
+
+    def ssh_keys_for(self, pc):
+        """Keys the PC must accept: those of current admins only. PermissionError if pending."""
+        if not self.approved(pc):
+            raise PermissionError("PC waits for approval by the hub owner")
+        cidr = str(self.cfg.get("ssh_allowed_cidr") or "").strip()
+        if not cidr:
+            raise ValueError("the hub owner has not set ssh_allowed_cidr (python hub.py ssh-cidr CIDR)")
+        cidr = a2a_ssh.validate_cidr(cidr)
+        admins = self.admin_names()
+        keys = []
+        for name, key in sorted(self.cfg.get("ssh_keys", {}).items()):
+            if name not in admins:
+                continue
+            try:
+                keys.append({"name": a2a_ssh.validate_name(name), "key": a2a_ssh.validate_pubkey(key)})
+            except ValueError:
+                continue
+        self.store.audit(pc, "ssh_keys", {"keys": [k["name"] for k in keys], "cidr": cidr})
+        return {"cidr": cidr, "keys": keys}
+
+    def ssh_log(self, pc, entry):
+        keep = ("id", "event", "time", "requester", "command", "client_ip", "exit_code",
+                "duration_s", "error")
+        detail = {k: entry.get(k) for k in keep if k in entry}
+        phases = {"ssh_start": "start", "ssh_end": "end", "ssh_refused": "refused"}
+        if detail.get("event") not in phases:
+            raise ValueError("bad ssh log event")
+        detail["pc"] = pc
+        detail["phase"] = phases[detail["event"]]
+        self.store.audit(pc, "ssh_command", detail)
+        return {"ok": True}
+
+    def ssh_target(self, admin, pc, command=None):
+        """Where an admin's ssh client must connect. Audits the request."""
+        if pc not in self.cfg["pcs"]:
+            raise ValueError(f"unknown PC '{pc}'")
+        if not self.approved(pc):
+            raise PermissionError(f"PC '{pc}' waits for approval by the hub owner")
+        if not self.cfg.get("ssh_keys", {}).get(admin):
+            raise PermissionError(f"admin '{admin}' has no SSH key on the hub "
+                                  "(python hub.py ssh-add-key NAME PUBKEY)")
+        row = self.store.q("SELECT ip, user FROM pcs_seen WHERE pc=?", (pc,))
+        ip = row[0]["ip"] if row else None
+        if not ip:
+            raise RuntimeError(f"the hub does not know the address of '{pc}' yet (it never polled)")
+        user = (row[0]["user"] or self.cfg["pcs"][pc].get("user") or "").strip()
+        self.store.audit(admin, "ssh_request", {"pc": pc, "ip": ip, "user": user, "command": command})
+        return {"pc": pc, "ip": ip, "user": user}
+
     # ---- housekeeping
     def sweep(self):
         """Fail tasks that run far past their timeout (receiver died without a word)."""
@@ -1050,6 +1119,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 body = self._body() if method == "POST" else {}
                 info = {k: body.get(k) for k in ("host", "user", "version")}
+                info["ip"] = self.client_address[0]
                 if p == "/api/worker/next" and method == "POST":
                     wait = min(float(body.get("wait", POLL_WAIT_S)), 60)
                     slots = body.get("slots")
@@ -1076,6 +1146,13 @@ class Handler(BaseHTTPRequestHandler):
                     if method == "POST" and len(parts) == 6 and parts[5] == "ack":
                         return self._send(200, h.ack_file(pc, tid, bool(body.get("ok")),
                                                           body.get("sha256"), body.get("error")))
+                if p == "/api/worker/ssh_keys" and method == "POST":
+                    try:
+                        return self._send(200, {"ok": True, **h.ssh_keys_for(pc)})
+                    except PermissionError as e:
+                        return self._send(403, {"ok": False, "error": str(e)})
+                if p == "/api/worker/ssh_log" and method == "POST":
+                    return self._send(200, h.ssh_log(pc, body))
                 if p == "/api/worker/heartbeat" and method == "POST":
                     return self._send(200, {"ok": True, **h.heartbeat(pc, body.get("task_id"), **info)})
                 if p == "/api/worker/result" and method == "POST":
@@ -1089,6 +1166,8 @@ class Handler(BaseHTTPRequestHandler):
                 role, who = h.who(self.headers.get("X-A2A-Token", ""))
                 if role is None:
                     return self._send(401, {"ok": False, "error": "bad token"})
+                if p == "/api/update/key":  # public key only; members that joined before updates pin it
+                    return self._send(200, {"ok": True, "update_pubkey": h.update_pubkey})
                 if role == "pc" and h.role_of(who) == "pending":
                     return self._send(403, {"ok": False, "error": "PC waits for approval by the hub owner"})
                 if p == "/api/update/manifest":
@@ -1125,6 +1204,15 @@ class Handler(BaseHTTPRequestHandler):
                         h.store.audit(admin, "transfer_delivered", {"transfer_id": t["id"], "name": t["name"],
                                                                     "src": t["src"], "dst": t["dst"]})
                         return
+                if method == "POST" and p == "/api/ssh/target":
+                    b = self._body()
+                    try:
+                        return self._send(200, {"ok": True, **h.ssh_target(admin, b.get("pc", ""),
+                                                                           b.get("command"))})
+                    except PermissionError as e:
+                        return self._send(403, {"ok": False, "error": str(e)})
+                    except RuntimeError as e:
+                        return self._send(409, {"ok": False, "error": str(e)})
                 if method == "GET" and p == "/api/whoami":
                     return self._send(200, {"ok": True, "admin": admin, "owner": self._owner})
                 # ---- owner only: membership
@@ -1219,8 +1307,10 @@ def make_release(cfg, version, source):
     out = os.path.join(dd, "releases", version)
     if os.path.exists(out):
         raise SystemExit(f"release {version} already exists: {out}")
+    # *.py for script installs; *.exe (TeamA2A-Agent.exe, built from the same receiver.py) for PCs
+    # installed with TeamA2A-Setup. Never *.json: receiver.json holds the PC's own token.
     names = sorted(n for n in os.listdir(source)
-                   if n.endswith(".py") and os.path.isfile(os.path.join(source, n)))
+                   if n.lower().endswith((".py", ".exe")) and os.path.isfile(os.path.join(source, n)))
     for n in names:
         safe_name(n)
     seed, pub = signing_key(dd)
@@ -1272,10 +1362,16 @@ def main(argv=None):
     sr.add_argument("name")
     sr.add_argument("role", choices=ROLES)
     sub.add_parser("update-key", help="show the public key of the update signing key")
+    sk = sub.add_parser("ssh-add-key", help="set the SSH public key of an admin")
+    sk.add_argument("name")
+    sk.add_argument("pubkey")
+    sub.add_parser("ssh-remove-key", help="remove the SSH key of an admin").add_argument("name")
+    sub.add_parser("ssh-cidr", help="set the network PCs accept SSH from").add_argument("cidr")
     rl = sub.add_parser("release", help="sign and publish a receiver update")
     rl.add_argument("--version", required=True)
     rl.add_argument("--source", default=os.path.join(os.path.dirname(HERE), "receiver"),
-                    help="folder with receiver.py and its modules (default: ..\\receiver)")
+                    help="folder with receiver.py, its modules and optionally TeamA2A-Agent.exe "
+                         "(default: ..\\receiver)")
     args = ap.parse_args(argv)
     cfg = load_config()
 
@@ -1323,6 +1419,31 @@ def main(argv=None):
         cfg["pcs"][args.name]["role"] = args.role
         save_config(cfg)
         print(f"{args.name} is now {args.role}")
+    elif args.cmd == "ssh-add-key":
+        pc_admins = {n for n, pc in cfg["pcs"].items() if pc.get("role") == "admin"}
+        if args.name not in cfg["admins"] and args.name not in pc_admins:
+            raise SystemExit(f"'{args.name}' is not an admin on this hub")
+        try:
+            a2a_ssh.validate_name(args.name)
+            key = a2a_ssh.validate_pubkey(args.pubkey)
+        except ValueError as e:
+            raise SystemExit(f"refused: {e}")
+        cfg["ssh_keys"] = {**cfg.get("ssh_keys", {}), args.name: key}
+        save_config(cfg)
+        print(f"SSH key of {args.name} saved. PCs pick it up at their next key sync (15 min).")
+    elif args.cmd == "ssh-remove-key":
+        keys = dict(cfg.get("ssh_keys", {}))
+        hit = keys.pop(args.name, None)
+        cfg["ssh_keys"] = keys
+        save_config(cfg)
+        print("removed" if hit else "not found")
+    elif args.cmd == "ssh-cidr":
+        try:
+            cfg["ssh_allowed_cidr"] = a2a_ssh.validate_cidr(args.cidr)
+        except ValueError as e:
+            raise SystemExit(str(e))
+        save_config(cfg)
+        print(f"PCs accept SSH from {cfg['ssh_allowed_cidr']} after their next key sync.")
     elif args.cmd == "update-key":
         print(signing_key(data_dir_of(cfg))[1].hex())
     elif args.cmd == "release":

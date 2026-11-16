@@ -193,7 +193,11 @@ class Installer:
             st, _ = http("POST", hub_url + "/api/worker/heartbeat", {}, token=old["token"])
             if st == 200:
                 self.log(f"This PC is already a member of the hub as '{old['name']}'.")
-                return hub_url, old["name"], old["token"]
+                pub = old.get("update_pubkey")
+                if not pub:  # joined before signed updates existed: pin the key now
+                    st, k = http("GET", hub_url + "/api/update/key", token=old["token"])
+                    pub = k.get("update_pubkey") if st == 200 else None
+                return hub_url, old["name"], old["token"], pub
         st, r = http("POST", hub_url + "/api/enroll",
                      {"join_code": code.strip(), "name": name.strip() or socket.gethostname(),
                       "host": socket.gethostname(), "user": getpass.getuser()})
@@ -201,9 +205,9 @@ class Installer:
             raise RuntimeError(f"The hub refused this PC: {r.get('error', st)}")
         self.log(f"Joined the hub as '{r['name']}'. The hub owner must approve this PC "
                  "before it gets tasks.")
-        return hub_url, r["name"], r["token"]
+        return hub_url, r["name"], r["token"], r.get("update_pubkey")
 
-    def step_config(self, hub_url, name, token, claude):
+    def step_config(self, hub_url, name, token, claude, update_pubkey=None):
         path = os.path.join(APP_DIR, "receiver.json")
         cfg = {}
         try:
@@ -214,6 +218,10 @@ class Installer:
         cfg.update({"name": name, "hub_url": hub_url, "token": token,
                     "claude_cmd": [claude, "-p", "--output-format", "json", "--dangerously-skip-permissions"],
                     "mcp_cmd": [os.path.join(APP_DIR, MCP_EXE)]})
+        if update_pubkey:
+            # The hub's update signing key, pinned now (trust on first use): only releases signed
+            # with it are installed by the agent's auto-update.
+            cfg["update_pubkey"] = update_pubkey
         cfg.setdefault("workdir", "")
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -284,8 +292,8 @@ Start-ScheduledTask -TaskName '{TASK}'
             raise RuntimeError("Enter the hub address (for example 192.168.1.157).")
         self.step_copy()
         claude = self.step_claude()
-        hub_url, name, token = self.step_join(hub_url, code, name)
-        self.step_config(hub_url, name, token, claude)
+        hub_url, name, token, update_pubkey = self.step_join(hub_url, code, name)
+        self.step_config(hub_url, name, token, claude, update_pubkey)
         self.step_autostart()
         if keep_awake:
             self.step_keep_awake()

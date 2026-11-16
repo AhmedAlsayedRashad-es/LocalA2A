@@ -2,6 +2,7 @@
 
 Run:  python receiver.py   or   TeamA2A-Agent.exe (installed by TeamA2A-Setup.exe)
 Send a file to another PC:  python receiver.py send-file --to PC-NAME PATH
+SSH helper:                 python receiver.py ssh [--config FILE] render-config|sync|hub-cidr|shell ...
 Config: receiver.json next to the program, else %LOCALAPPDATA%\\TeamA2A\\receiver.json.
 Python 3.8+, standard library only.
 """
@@ -705,6 +706,11 @@ class Receiver:
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["ssh"]:
+        # SSH helper (render-config, sync, hub-cidr, shell): see a2a_ssh.py.
+        import a2a_ssh
+        return a2a_ssh.main(argv[1:], default_config=CONFIG_PATH)
     ap = argparse.ArgumentParser(description="Team A2A receiver")
     ap.add_argument("--config", help="receiver.json (default: next to the program, else %%LOCALAPPDATA%%)")
     sub = ap.add_subparsers(dest="cmd")

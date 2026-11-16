@@ -3,12 +3,16 @@
 Env:  A2A_HUB_URL (default http://127.0.0.1:8765), A2A_ADMIN_TOKEN (from `python hub.py add-admin NAME`)
 Python 3.8+, standard library only.
 """
+import hashlib
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import quote
 
 def _installed():
     """The PC's own receiver.json (installed by TeamA2A-Setup). Its token works here once the
@@ -155,6 +159,201 @@ def t_cancel(a):
     return json.dumps(r)
 
 
+# ---- files (they go through the hub: upload, store, the PC fetches it when it polls)
+CHUNK = 65536
+TRANSFER_FINAL = ("delivered", "failed", "expired")
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(CHUNK), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _http_error(e):
+    try:
+        msg = json.loads(e.read().decode("utf-8")).get("error")
+    except Exception:
+        msg = str(e)
+    return RuntimeError(f"hub said HTTP {e.code}: {msg}")
+
+
+def _wait_transfer(tid, wait_s, until):
+    """Poll the transfer until its status is in `until` (or final), or wait_s passes."""
+    end = time.time() + max(0, float(wait_s))
+    while True:
+        t = hub("GET", f"/api/files/{quote(tid)}")["transfer"]
+        if t["status"] in until or t["status"] in TRANSFER_FINAL or time.time() >= end:
+            return t
+        time.sleep(min(1, max(0.2, end - time.time())))
+
+
+def _fmt_transfer(t):
+    s = (f"transfer={t['id']} {t['src']} -> {t['dst']} name={t['name']} status={t['status']}"
+         f" size={t['size'] if t['size'] is not None else '?'}")
+    if t.get("error"):
+        s += f"\nERROR: {t['error']}"
+    return s
+
+
+def t_send_file(a):
+    path = os.path.abspath(os.path.expanduser(str(a.get("path") or "")))
+    if not os.path.isfile(path):
+        raise RuntimeError(f"file not found: {path}")
+    to = str(a.get("to") or "").strip()
+    if not to:
+        raise RuntimeError("give 'to' (the PC name)")
+    size, digest = os.path.getsize(path), _sha256_file(path)
+    url = f"{HUB}/api/files/send?to={quote(to)}&name={quote(os.path.basename(path))}"
+    with open(path, "rb") as f:
+        req = urllib.request.Request(url, data=f, method="POST", headers={
+            "Content-Type": "application/octet-stream", "Content-Length": str(size),
+            "X-A2A-Token": TOKEN, "X-A2A-SHA256": digest})
+        try:
+            with OPENER.open(req, timeout=600) as r:
+                tid = json.loads(r.read().decode("utf-8"))["transfer_id"]
+        except urllib.error.HTTPError as e:
+            raise _http_error(e)
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"cannot reach the hub at {HUB}: {e.reason}")
+    t = _wait_transfer(tid, a.get("wait_seconds", 60), ("delivered",))
+    head = f"Uploaded {size} bytes (sha256 {digest})."
+    if t["status"] not in TRANSFER_FINAL:
+        head += f" Not delivered yet: {to} gets it when it polls the hub (see list_transfers)."
+    elif t["status"] == "delivered":
+        head += f" Delivered to the a2a-inbox folder on {to}."
+    return head + "\n" + _fmt_transfer(t)
+
+
+def _save_path(save_to, name):
+    if save_to:
+        dest = os.path.abspath(os.path.expanduser(save_to))
+        if os.path.isdir(dest) or save_to.endswith(("/", "\\")):
+            os.makedirs(dest, exist_ok=True)
+            dest = os.path.join(dest, name)
+        else:
+            os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+            return dest
+    else:
+        folder = os.path.join(os.path.expanduser("~"), "a2a-inbox")
+        os.makedirs(folder, exist_ok=True)
+        dest = os.path.join(folder, name)
+    stem, ext = os.path.splitext(dest)
+    i = 2
+    while os.path.exists(dest):
+        dest, i = f"{stem} ({i}){ext}", i + 1
+    return dest
+
+
+def t_fetch_file(a):
+    pc, path = str(a.get("pc") or "").strip(), str(a.get("path") or "").strip()
+    if not pc or not path:
+        raise RuntimeError("give 'pc' and 'path'")
+    t = hub("POST", "/api/files/request", {"pc": pc, "path": path})["transfer"]
+    t = _wait_transfer(t["id"], a.get("wait_seconds", 120), ("stored",))
+    if t["status"] != "stored":
+        if t["status"] in TRANSFER_FINAL:
+            return "The file did not come.\n" + _fmt_transfer(t)
+        return (f"Still waiting: {pc} sends the file when it polls the hub. "
+                f"Run fetch_file again later, or list_transfers.\n" + _fmt_transfer(t))
+    dest = _save_path(a.get("save_to"), t["name"])
+    part = dest + ".part"
+    req = urllib.request.Request(f"{HUB}/api/files/{quote(t['id'])}/download", method="GET",
+                                 headers={"X-A2A-Token": TOKEN})
+    h, size = hashlib.sha256(), 0
+    try:
+        with OPENER.open(req, timeout=600) as r, open(part, "wb") as out:
+            while True:
+                chunk = r.read(CHUNK)
+                if not chunk:
+                    break
+                h.update(chunk)
+                out.write(chunk)
+                size += len(chunk)
+    except urllib.error.HTTPError as e:
+        _unlink(part)
+        raise _http_error(e)
+    except Exception:
+        _unlink(part)
+        raise
+    if h.hexdigest() != t["sha256"]:
+        _unlink(part)
+        raise RuntimeError("sha256 mismatch: the file was damaged on the way; nothing was saved")
+    os.replace(part, dest)
+    return f"Saved {size} bytes from {pc}:{path} to {dest} (sha256 {t['sha256']})."
+
+
+def _unlink(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+# ---- SSH: the hub says where the PC is; the PC's forced command logs every command
+def ssh_exe():
+    if os.environ.get("A2A_SSH_EXE"):
+        return os.environ["A2A_SSH_EXE"]
+    found = shutil.which("ssh")
+    if found:
+        return found
+    win = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "System32", "OpenSSH", "ssh.exe")
+    if os.path.exists(win):
+        return win
+    raise RuntimeError("no ssh client found (install the Windows OpenSSH client, or set A2A_SSH_EXE)")
+
+
+def ssh_args(key, user, host, command, connect_timeout=10):
+    """Arguments after the ssh program. Key only, no prompts, no forwarding, no tty."""
+    host, user = str(host), str(user)
+    if not host or host.startswith("-") or any(c.isspace() for c in host):
+        raise ValueError(f"bad host '{host}'")
+    if not user or user.startswith("-") or any(c.isspace() for c in user):
+        raise ValueError(f"bad user '{user}'")
+    return ["-T", "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
+            "-o", "KbdInteractiveAuthentication=no", "-o", "PreferredAuthentications=publickey",
+            "-o", "StrictHostKeyChecking=accept-new", "-o", "IdentitiesOnly=yes",
+            "-o", "ClearAllForwardings=yes", "-o", f"ConnectTimeout={int(connect_timeout)}",
+            "-i", key, "-l", user, "--", host, command]
+
+
+def t_ssh_run(a):
+    pc, command = str(a.get("pc") or "").strip(), str(a.get("command") or "")
+    if not pc or not command.strip():
+        raise RuntimeError("give 'pc' and 'command'")
+    timeout = min(3600, max(1, int(a.get("timeout", 60))))
+    key = os.environ.get("A2A_SSH_KEY") or os.path.join(os.path.expanduser("~"), ".ssh", "id_ed25519")
+    if not os.path.isfile(key):
+        raise RuntimeError(f"no SSH private key at {key} (set A2A_SSH_KEY)")
+    exe = ssh_exe()
+    t = hub("POST", "/api/ssh/target", {"pc": pc, "command": command})
+    args = [exe] + ssh_args(key, t["user"], t["ip"], command, min(timeout, 15))
+    try:
+        p = subprocess.run(args, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL,
+                           creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    except subprocess.TimeoutExpired:
+        return f"[{pc}] timeout after {timeout} s (the command may still run on the PC)"
+    out = p.stdout.decode("utf-8", "replace")
+    err = p.stderr.decode("utf-8", "replace")
+    text = f"[{pc} {t['user']}@{t['ip']}] exit={p.returncode}"
+    if out.strip():
+        text += "\n" + out.rstrip()
+    if err.strip():
+        text += "\nSTDERR:\n" + err.rstrip()
+    if p.returncode == 255:
+        text += "\n(exit 255 = ssh could not connect or log in: is SSH set up on that PC and the key synced?)"
+    return text
+
+
+def t_list_transfers(a):
+    r = hub("GET", f"/api/files?limit={int(a.get('limit', 20))}")
+    if not r["transfers"]:
+        return "No transfers."
+    return "\n".join(f"- {t['created']} " + _fmt_transfer(t) for t in r["transfers"])
+
+
 TOOLS = [
     {"name": "list_pcs", "fn": t_list_pcs,
      "description": "List colleague PCs on the Team A2A hub: online or offline, busy, queued tasks, groups.",
@@ -193,6 +392,35 @@ TOOLS = [
      "description": "Cancel a queued task, or stop a running one.",
      "inputSchema": {"type": "object", "properties": {"task_id": {"type": "string"}},
                      "required": ["task_id"]}},
+    {"name": "send_file", "fn": t_send_file,
+     "description": ("Send a file from this PC to a colleague PC through the hub. It arrives in the "
+                     "a2a-inbox folder of the PC's work folder. The hub checks size and sha256."),
+     "inputSchema": {"type": "object", "properties": {
+         "to": {"type": "string", "description": "PC name on the hub."},
+         "path": {"type": "string", "description": "Path of the file on this PC."},
+         "wait_seconds": {"type": "number", "description": "Wait this long for delivery (default 60)."}},
+         "required": ["to", "path"]}},
+    {"name": "fetch_file", "fn": t_fetch_file,
+     "description": ("Get a file from a colleague PC through the hub. The PC uploads it when it polls; "
+                     "the file is saved here (default: ~/a2a-inbox)."),
+     "inputSchema": {"type": "object", "properties": {
+         "pc": {"type": "string", "description": "PC name on the hub."},
+         "path": {"type": "string", "description": "Path of the file on that PC (relative = its work folder)."},
+         "save_to": {"type": "string", "description": "File or folder on this PC (optional)."},
+         "wait_seconds": {"type": "number", "description": "Wait this long for the PC (default 120)."}},
+         "required": ["pc", "path"]}},
+    {"name": "list_transfers", "fn": t_list_transfers,
+     "description": "List recent file transfers and their status (stored, offered, delivered, failed, expired).",
+     "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer"}}}},
+    {"name": "ssh_run", "fn": t_ssh_run,
+     "description": ("Run one cmd.exe command on a colleague PC over SSH (key only) and get its output "
+                     "and exit code. The PC logs the command and the hub audits it. Needs SSH set up on "
+                     "the PC (setup_ssh.ps1) and your key on the hub. No interactive shell."),
+     "inputSchema": {"type": "object", "properties": {
+         "pc": {"type": "string", "description": "PC name on the hub."},
+         "command": {"type": "string", "description": "cmd.exe command line, for example 'ipconfig /all'."},
+         "timeout": {"type": "integer", "description": "Seconds (default 60, max 3600)."}},
+         "required": ["pc", "command"]}},
 ]
 BY_NAME = {t["name"]: t for t in TOOLS}
 
