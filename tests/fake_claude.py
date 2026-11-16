@@ -59,4 +59,10 @@ else:
     out["result"] = (f"ECHO: {msg.strip()} | turn={len(hist)} | sp={'yes' if 'Team A2A' in sp else 'no'}"
                      f" | admin_in_sp={'yes' if 'admin' in sp else 'no'}")
 print("some log line that is not JSON")
+# Like `--output-format stream-json --verbose`: the plan limits come before the result line.
+print(json.dumps({"type": "rate_limit_event", "rate_limit_info": {
+    "status": "allowed", "resetsAt": 4102444800, "rateLimitType": "five_hour", "unifiedWindows": {
+        "five_hour": {"utilization": 0.37, "resetsAt": 4102444800, "status": "allowed"},
+        "seven_day": {"utilization": 0.05, "resetsAt": 4103049600, "status": "allowed"}}},
+    "session_id": sid}))
 print(json.dumps(out))
