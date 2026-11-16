@@ -51,8 +51,10 @@ Needs: Python 3.8+, Claude Code CLI installed and signed in to the colleague's s
    (add `-NoSleep` in an elevated PowerShell to turn off sleep on AC power).
 4. At night: lock the PC (Win+L). Do not log off and do not let it sleep.
 
-The receiver runs one task at a time. Logs: `receiver\logs\receiver.jsonl`. Remove: `uninstall_receiver.ps1`.
-Optional `receiver.json` keys: `workdir` (default: user home), `extra_system_prompt`, `claude_cmd`.
+The receiver runs up to `max_parallel` tasks at once (default 3). Logs: `receiver\logs\receiver.jsonl`. Remove: `uninstall_receiver.ps1`.
+Optional `receiver.json` keys: `workdir` (default: user home), `extra_system_prompt`, `claude_cmd`,
+`max_parallel` (default 3; 1 = one task at a time), `auto_update` (default true), `update_check_s` (default 3600),
+`update_pubkey` (the hub's update key; written by `TeamA2A-Setup.exe`, or copy it from `hub.py add-pc`).
 
 ## 3. Admin MCP (each admin's Claude)
 
@@ -67,7 +69,8 @@ Add to the Claude desktop app / Claude Code MCP config:
 ```
 
 Tools: `list_pcs`, `send` (to a PC, `group:NAME`, `all`, or continue a thread with `context_id`), `get_thread`,
-`get_broadcast`, `list_tasks`, `morning_report`, `cancel`.
+`get_broadcast`, `list_tasks`, `morning_report`, `cancel`, `send_file`, `fetch_file`, `list_transfers`, `ssh_run`.
+For `ssh_run`: optional env `A2A_SSH_KEY` (default `~\.ssh\id_ed25519`) and `A2A_SSH_EXE` (default: `ssh` on PATH).
 Ask your Claude, for example: "Ask group:revit which Revit versions are installed" or "Show the morning report".
 
 ## How a task works
@@ -77,13 +80,82 @@ Ask your Claude, for example: "Ask group:revit which Revit versions are installe
   `needs_input` = the remote Claude asked a question (reply starts with `QUESTION:`); answer with `send` + `context_id`.
 - Offline PCs keep their tasks queued and run them when they come online.
 
+## Parallel tasks
+
+- A PC runs up to `max_parallel` tasks at once (receiver.json, default 3). The hub never runs two turns of one
+  thread at the same time; later turns of a thread wait for the earlier one.
+- Each thread runs in its own folder `<workdir>\a2a-sessions\<thread id>`, so `--resume` finds its session.
+- Old receivers (1.1) keep working: they get one task at a time.
+
+## File transfer
+
+**Direct mode (default when possible):** the bytes go straight from the sender to the PC, not through the hub.
+The hub only checks who may send what, gives the sender a ticket for 10 minutes (signed with the token of the PC
+that takes or serves the file, so only that PC accepts it, and only once), and writes the audit log
+(`transfer_direct`, then `transfer_delivered` / `transfer_failed` with `mode: direct`).
+
+- Each PC runs a small file server on port 8766 (`direct_port`) when `"direct": true` is in its receiver.json.
+  `TeamA2A-Setup.exe` asks once for admin rights to add the firewall rule "TeamA2A Direct" (the agent only,
+  port 8766, local network only) and turns `direct` on only when the rule exists. Silent installs add the rule
+  only when run elevated (`--no-direct` to skip). Script installs: add the rule by hand and set `"direct": true`.
+- **Hub relay (fallback):** when the PC has no direct port, is offline, or does not answer in 5 s, the file goes
+  through the hub as before (no port needed on the PC; offline PCs get it later). The tool output says which way
+  the file went.
+
+- Admin to PC: MCP `send_file {to, path}`. The file arrives in `<workdir>\a2a-inbox` on that PC
+  (`name (2).ext` when the name exists).
+- PC to admin: MCP `fetch_file {pc, path, save_to}`. A relative path is read from the PC's work folder.
+  Default save folder: `~\a2a-inbox`.
+- PC to PC: the remote Claude runs `receiver.py send-file --to PC-NAME FILE` (the system prompt tells it how).
+- Limits and checks: `max_transfer_mb` in hub.json (default 200, checked before the upload is read), sha256 checked by
+  the hub and again by the receiver, plain file names only, sender and receiver must be approved. Files nobody
+  fetched expire after `transfer_ttl_h` (default 24) and are deleted. Every step is in the audit log
+  (`transfer_upload`, `transfer_delivered`, `transfer_rejected`, `transfer_failed`, `transfer_expired`).
+- MCP `list_transfers` shows the status: `direct` / `direct_get` (direct, running), `stored` / `offered` (relay,
+  waits for the PC), `delivered`, `failed`, `expired`.
+
+## Signed updates of the receiver
+
+1. Set `VERSION = "1.3"` in `receiver\receiver.py` (it must match the release version).
+2. For PCs installed with `TeamA2A-Setup.exe`: build again and put `TeamA2A-Agent.exe` (from `build\work\bin`) in the
+   source folder too. Script installs only need the `.py` files.
+3. On the hub PC: `python hub.py release --version 1.3 [--source ..\receiver]`. The hub signs the package with its
+   update key (`<data_dir>\update_signing_key.json`, never served, never in git). `*.json` files never go in.
+4. Each receiver with `update_pubkey` checks every `update_check_s` (and when the hub says a newer version exists),
+   checks the signature, the version (only newer), the size and every file's sha256, waits until its tasks end,
+   backs up the old files to `update_backup\<old version>\`, swaps the files and starts again.
+
+- `python hub.py update-key` prints the public key. `add-pc` prints it in the receiver.json; `TeamA2A-Setup.exe`
+  writes it when the PC joins. A receiver without `update_pubkey` never installs updates. PCs that joined before
+  this version: run the new `TeamA2A-Setup.exe` once; it keeps the membership and pins the key.
+- Turn off on one PC: `"auto_update": false` in its receiver.json.
+
+## SSH to a colleague PC (cmd.exe)
+
+For quick checks without Claude: `ssh_run {pc, command}` runs one cmd.exe command over SSH and returns output
+and exit code. Key only, no password, no interactive shell, no forwarding. The PC logs every command in
+`%LOCALAPPDATA%\TeamA2A\logs\ssh_commands.jsonl` and the hub audits it (`ssh_request`, `ssh_command`).
+
+1. Hub owner, once:
+   `python hub.py ssh-cidr 192.168.1.0/24` (the network PCs accept SSH from) and
+   `python hub.py ssh-add-key ahmed "ssh-ed25519 AAAA... ahmed"` per admin (`ssh-remove-key NAME` to remove).
+   Make a key with `ssh-keygen -t ed25519` (it goes to `~\.ssh\id_ed25519`).
+2. IT, once per PC, elevated, with `TeamA2A-SSH.exe` and `setup_ssh.ps1` from `dist\`:
+   `powershell -ExecutionPolicy Bypass -File setup_ssh.ps1 -User colleague -ReceiverConfig C:\Users\colleague\AppData\Local\TeamA2A\receiver.json`
+   It installs OpenSSH Server, writes a key-only `sshd_config` (`AllowUsers` that user), opens port 22 only for the
+   hub network, sets cmd.exe as the SSH shell and adds the SYSTEM task "TeamA2A SSH key sync" (every 15 min).
+3. Keys of admins who are removed from the hub disappear from the PCs at the next sync. A PC that is removed or
+   not approved gets an empty keys file.
+
 ## Tests
 
 ```
-python -m unittest tests.test_e2e -v
+python -m unittest discover -s tests -v
 ```
 
 The tests start a real hub, real receivers and the admin MCP, with `tests/fake_claude.py` in place of `claude`.
+Use `discover -s tests` (a `tests` package in site-packages can hide this folder). Inside a Team A2A task, unset
+`A2A_IN_TASK` first. `test_installers` needs a PyInstaller build and is skipped without one.
 
 ## Old: Codex to Codex (2 PCs)
 

@@ -355,6 +355,7 @@ class E2E(unittest.TestCase):
 
     def test_14_admin_mcp_stdio(self):
         env = dict(os.environ, A2A_HUB_URL=self.url, A2A_ADMIN_TOKEN=ADMIN_TOKEN)
+        env.pop("A2A_IN_TASK", None)  # this test may itself run inside a Team A2A task
         p = subprocess.Popen([sys.executable, os.path.join(ROOT, "admin_mcp", "admin_mcp.py")],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
 
@@ -371,7 +372,8 @@ class E2E(unittest.TestCase):
             p.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
             names = {t["name"] for t in rpc(2, "tools/list")["result"]["tools"]}
             self.assertEqual(names, {"list_pcs", "send", "get_thread", "get_broadcast", "list_tasks",
-                                     "morning_report", "cancel"})
+                                     "morning_report", "cancel", "send_file", "fetch_file",
+                                     "list_transfers", "ssh_run"})
             txt = rpc(3, "tools/call", {"name": "list_pcs", "arguments": {}})["result"]["content"][0]["text"]
             self.assertIn("pc1: ONLINE", txt)
             res = rpc(4, "tools/call", {"name": "send", "arguments": {

@@ -86,9 +86,17 @@ class Installers(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(setup.APP_DIR, "TeamA2A-Agent.exe")))
         with self.assertRaises(RuntimeError):
             inst.step_join(URL, "wrong", "x")
-        hub_url, name, token = inst.step_join("127.0.0.1:%d" % PORT, "JOIN-TEST", "test pc!")
+        hub_url, name, token, pubkey = inst.step_join("127.0.0.1:%d" % PORT, "JOIN-TEST", "test pc!")
         self.assertEqual((hub_url, name), (URL, "testpc"))
-        inst.step_config(hub_url, name, token, "claude")
+        self.assertRegex(pubkey or "", r"^[0-9a-f]{64}$")  # the hub's update key, pinned at enroll
+        inst.step_config(hub_url, name, token, "claude", pubkey)
+        with open(os.path.join(setup.APP_DIR, "receiver.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["update_pubkey"], pubkey)
+        if not setup.is_admin():  # no UAC prompt in a test: without the firewall rule direct mode stays off
+            self.assertFalse(inst.step_direct(ask=False))
+            with open(os.path.join(setup.APP_DIR, "receiver.json"), encoding="utf-8") as f:
+                cfgd = json.load(f)
+            self.assertEqual((cfgd["direct"], cfgd["direct_port"]), (False, 8766))
         self.assertEqual(http("POST", "/api/send", {"to": "testpc", "message": "x"})[0], 400)  # pending
         self.assertEqual(http("POST", "/api/pcs/testpc/approve", {})[0], 200)
         # a second run keeps the same membership

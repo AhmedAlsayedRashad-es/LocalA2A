@@ -2,7 +2,7 @@
 
 The hub owner decides who is an admin; this installer is the same for everyone.
   TeamA2A-Setup.exe                         window
-  TeamA2A-Setup.exe --silent [--hub URL] [--code CODE] [--name NAME] [--no-keep-awake]
+  TeamA2A-Setup.exe --silent [--hub URL] [--code CODE] [--name NAME] [--no-keep-awake] [--no-direct]
   TeamA2A-Setup.exe --uninstall [--silent]
 Installs per user (no admin rights): %LOCALAPPDATA%\\TeamA2A
 """
@@ -23,6 +23,8 @@ APP = "TeamA2A"
 VERSION = "1.1"
 APP_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), APP)
 AGENT_EXE = "TeamA2A-Agent.exe"
+DIRECT_RULE = "TeamA2A Direct"
+DIRECT_PORT = 8766
 MCP_EXE = "TeamA2A-MCP.exe"
 SETUP_EXE = "TeamA2A-Setup.exe"
 TASK = "TeamA2A Agent"
@@ -70,6 +72,14 @@ def http(method, url, body=None, token=None, timeout=15):
             return e.code, json.loads(e.read().decode("utf-8"))
         except ValueError:
             return e.code, {"error": str(e)}
+
+
+def is_admin():
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
 
 
 def q(text):
@@ -193,7 +203,11 @@ class Installer:
             st, _ = http("POST", hub_url + "/api/worker/heartbeat", {}, token=old["token"])
             if st == 200:
                 self.log(f"This PC is already a member of the hub as '{old['name']}'.")
-                return hub_url, old["name"], old["token"]
+                pub = old.get("update_pubkey")
+                if not pub:  # joined before signed updates existed: pin the key now
+                    st, k = http("GET", hub_url + "/api/update/key", token=old["token"])
+                    pub = k.get("update_pubkey") if st == 200 else None
+                return hub_url, old["name"], old["token"], pub
         st, r = http("POST", hub_url + "/api/enroll",
                      {"join_code": code.strip(), "name": name.strip() or socket.gethostname(),
                       "host": socket.gethostname(), "user": getpass.getuser()})
@@ -201,9 +215,9 @@ class Installer:
             raise RuntimeError(f"The hub refused this PC: {r.get('error', st)}")
         self.log(f"Joined the hub as '{r['name']}'. The hub owner must approve this PC "
                  "before it gets tasks.")
-        return hub_url, r["name"], r["token"]
+        return hub_url, r["name"], r["token"], r.get("update_pubkey")
 
-    def step_config(self, hub_url, name, token, claude):
+    def step_config(self, hub_url, name, token, claude, update_pubkey=None):
         path = os.path.join(APP_DIR, "receiver.json")
         cfg = {}
         try:
@@ -214,6 +228,10 @@ class Installer:
         cfg.update({"name": name, "hub_url": hub_url, "token": token,
                     "claude_cmd": [claude, "-p", "--output-format", "json", "--dangerously-skip-permissions"],
                     "mcp_cmd": [os.path.join(APP_DIR, MCP_EXE)]})
+        if update_pubkey:
+            # The hub's update signing key, pinned now (trust on first use): only releases signed
+            # with it are installed by the agent's auto-update.
+            cfg["update_pubkey"] = update_pubkey
         cfg.setdefault("workdir", "")
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -247,6 +265,38 @@ Start-ScheduledTask -TaskName '{TASK}'
             winreg.SetValueEx(k, APP, 0, winreg.REG_SZ, f'"{agent}"')
         subprocess.Popen([agent], cwd=APP_DIR, creationflags=subprocess.DETACHED_PROCESS | NOWIN)
 
+    def step_direct(self, ask=True):
+        """Direct file transfer: an inbound firewall rule for the agent on DIRECT_PORT (local network only).
+        Needs admin rights once (UAC). Turns 'direct' on in receiver.json only when the rule exists;
+        without it other PCs send through the hub relay. ask=False: only when already elevated (no prompt)."""
+        agent = os.path.join(APP_DIR, AGENT_EXE)
+        rule = (f"Remove-NetFirewallRule -DisplayName '{DIRECT_RULE}' -ErrorAction SilentlyContinue; "
+                f"New-NetFirewallRule -DisplayName '{DIRECT_RULE}' -Direction Inbound -Program '{q(agent)}' "
+                f"-LocalPort {DIRECT_PORT} -Protocol TCP -Action Allow -Profile Domain,Private "
+                f"-RemoteAddress LocalSubnet | Out-Null")
+        if is_admin():
+            ps(rule, timeout=120)
+        elif ask:
+            self.log("Opening the direct file transfer port (Windows asks for admin rights; "
+                     "No = files come through the hub) ...")
+            ps(f"Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden "
+               f"-ArgumentList '-NoProfile','-Command',\"{rule}\"", timeout=300)
+        code, _ = ps(f"if (Get-NetFirewallRule -DisplayName '{DIRECT_RULE}' -ErrorAction SilentlyContinue) "
+                     "{ exit 0 } else { exit 1 }")
+        on = code == 0
+        path = os.path.join(APP_DIR, "receiver.json")
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        cfg["direct"] = on
+        cfg.setdefault("direct_port", DIRECT_PORT)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        os.replace(tmp, path)
+        self.log(f"Direct file transfer: on (port {DIRECT_PORT})." if on else
+                 "Direct file transfer: off (no firewall rule). Files come through the hub.")
+        return on
+
     def step_keep_awake(self):
         code, out = ps("powercfg /change standby-timeout-ac 0; powercfg /change hibernate-timeout-ac 0")
         self.log("Sleep on AC power: off." if code == 0 else
@@ -279,13 +329,15 @@ Start-ScheduledTask -TaskName '{TASK}'
             time.sleep(2)
         self.log("The agent did not write its log yet. Check Task Scheduler > 'TeamA2A Agent'.")
 
-    def install(self, hub_url, code, name, keep_awake=True):
+    def install(self, hub_url, code, name, keep_awake=True, direct=True, ask=True):
         if not hub_url:
             raise RuntimeError("Enter the hub address (for example 192.168.1.157).")
         self.step_copy()
         claude = self.step_claude()
-        hub_url, name, token = self.step_join(hub_url, code, name)
-        self.step_config(hub_url, name, token, claude)
+        hub_url, name, token, update_pubkey = self.step_join(hub_url, code, name)
+        self.step_config(hub_url, name, token, claude, update_pubkey)
+        if direct:
+            self.step_direct(ask)
         self.step_autostart()
         if keep_awake:
             self.step_keep_awake()
@@ -300,6 +352,8 @@ def uninstall(log):
     log("Stopping the agent ...")
     stop_agent()
     ps(f"Unregister-ScheduledTask -TaskName '{TASK}' -Confirm:$false -ErrorAction SilentlyContinue")
+    if is_admin():
+        ps(f"Remove-NetFirewallRule -DisplayName '{DIRECT_RULE}' -ErrorAction SilentlyContinue")
     for key, value in ((r"Software\Microsoft\Windows\CurrentVersion\Run", APP),):
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key, 0, winreg.KEY_SET_VALUE) as k:
@@ -349,6 +403,7 @@ def gui(d):
     v_code = tk.StringVar(value=d.get("join_code", ""))
     v_name = tk.StringVar(value=socket.gethostname())
     v_awake = tk.BooleanVar(value=True)
+    v_direct = tk.BooleanVar(value=True)
     rows = [("Hub address", v_hub, ""), ("Join code", v_code, "*"), ("PC name", v_name, "")]
     for i, (label, var, show) in enumerate(rows):
         ttk.Label(form, text=label).grid(row=i, column=0, sticky="w", pady=3)
@@ -357,7 +412,9 @@ def gui(d):
         if label == "Join code" and d.get("join_code"):
             e.configure(state="disabled")  # built into this installer
     ttk.Checkbutton(frm, text="Keep this PC awake on AC power (needed for night tasks)",
-                    variable=v_awake).pack(anchor="w", pady=(6, 6))
+                    variable=v_awake).pack(anchor="w", pady=(6, 0))
+    ttk.Checkbutton(frm, text="Allow direct file transfer on the office network (asks for admin rights once)",
+                    variable=v_direct).pack(anchor="w", pady=(0, 6))
     btns = ttk.Frame(frm)
     btns.pack(fill="x")
     out = tk.Text(frm, height=12, wrap="word", state="disabled", font=("Consolas", 9))
@@ -388,7 +445,8 @@ def gui(d):
         threading.Thread(target=work, daemon=True).start()
 
     def do_install():
-        run(lambda: Installer(log).install(v_hub.get(), v_code.get(), v_name.get(), v_awake.get()),
+        run(lambda: Installer(log).install(v_hub.get(), v_code.get(), v_name.get(), v_awake.get(),
+                                           v_direct.get()),
             "Team A2A is installed and running.")
 
     def do_uninstall():
@@ -412,6 +470,7 @@ def main(argv=None):
     ap.add_argument("--code")
     ap.add_argument("--name", default="")
     ap.add_argument("--no-keep-awake", action="store_true")
+    ap.add_argument("--no-direct", action="store_true", help="no direct file transfer (no firewall rule)")
     a = ap.parse_args(argv)
     d = defaults()
     if a.hub:
@@ -431,7 +490,9 @@ def main(argv=None):
         return 0
     if a.silent:
         try:
-            Installer(log).install(d["hub_url"], d["join_code"], a.name, not a.no_keep_awake)
+            # Silent: the firewall rule only when already elevated (IT); never a UAC prompt.
+            Installer(log).install(d["hub_url"], d["join_code"], a.name, not a.no_keep_awake,
+                                   not a.no_direct, ask=False)
             return 0
         except Exception as e:
             log(f"ERROR: {e}")

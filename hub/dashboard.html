@@ -67,7 +67,7 @@ async function renderPcs() {
   <div class="card"><table><tr><th>PC</th><th>Role</th><th>State</th><th>User</th><th>Groups</th><th>Busy</th><th>Queued</th><th>Last seen</th>${isOwner ? '<th></th>' : ''}</tr>
   ${r.pcs.map(p => `<tr><td><b>${esc(p.name)}</b></td><td>${pill(p.approved ? p.role : 'pending')}</td><td>${pill(p.online ? 'online' : 'offline')}</td><td>${esc(p.user)}</td>
   <td>${isOwner ? `<input data-g="${esc(p.name)}" value="${esc(p.groups.join(', '))}" style="min-width:120px">` : esc(p.groups.join(', '))}</td>
-  <td>${esc(p.busy_task || '')}</td><td>${p.queued}</td><td class="mut">${esc(p.last_seen || 'never')}</td>
+  <td>${esc(p.busy_task || '')}${p.running > 1 ? ' (+' + (p.running - 1) + ')' : ''}</td><td>${p.queued}</td><td class="mut">${esc(p.last_seen || 'never')}</td>
   ${isOwner ? `<td style="white-space:nowrap">${p.approved
     ? `<button data-role="${p.role === 'admin' ? 'user' : 'admin'}" data-pc="${esc(p.name)}">${p.role === 'admin' ? 'Make user' : 'Make admin'}</button>
        <button data-rm="${esc(p.name)}">Remove</button>`
