@@ -1,7 +1,8 @@
 """Stand-in for `claude -p --output-format json` used by the tests.
 
 The message (stdin) picks the behaviour:
-  SLEEP n     sleep n seconds, then answer
+  SLEEP n     sleep n seconds, then answer (default echo, with the turn number)
+  CWD         answer 'CWD: <current folder>'
   BIG n       answer with n Arabic letters
   ASK         answer with 'QUESTION: ...'
   FAIL        JSON result with is_error=true
@@ -49,6 +50,8 @@ if first == "BIG":
     out["result"] = "م" * int(msg.split()[1])  # Arabic letter, n times
 elif first == "ASK":
     out["result"] = "QUESTION: which drive should I clean, C or D?"
+elif first == "CWD":
+    out["result"] = "CWD: " + os.getcwd()
 elif first == "FAIL":
     out["is_error"] = True
     out["result"] = "API Error: something broke"

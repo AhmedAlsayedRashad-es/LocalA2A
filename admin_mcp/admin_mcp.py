@@ -86,6 +86,7 @@ def t_list_pcs(a):
     for p in r["pcs"]:
         state = "ONLINE" if p["online"] else "offline"
         busy = f" busy={p['busy_task']}" if p["busy_task"] else ""
+        busy += f" running={p.get('running', 1 if p['busy_task'] else 0)}"
         lines.append(f"- {p['name']}: {state}{busy} queued={p['queued']} groups={','.join(p['groups'])}"
                      f" user={p['user'] or '?'} last_seen={p['last_seen'] or 'never'}")
     return "\n".join(lines)
