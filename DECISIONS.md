@@ -1,17 +1,17 @@
 # Summary
 
-All four features are done on branch `feature/parallel-ftp-update-ssh` (2026-11-16). Full suite: 70 tests OK
+All four features are done on branch `feature/parallel-ftp-update-ssh` (2026-11-16). Full suite: 79 tests OK
 (`python -m unittest discover -s tests`, with `A2A_IN_TASK` unset), including `test_installers` against freshly built exes.
 
 | Feature | Tests | State |
 |---|---|---|
 | 1 Parallel sessions | `test_parallel` 7/7, `test_e2e` 20/20 | works |
-| 2 File transfer (hub-relayed) | `test_transfer` 11/11 | works |
+| 2 File transfer (direct first, hub relay as fallback) | `test_direct` 9/9, `test_transfer` 11/11 | works on one PC; a real LAN is a human check |
 | 3 Signed receiver updates | `test_sign` 3/3, `test_update` 12/12 | works for script installs; exe swap is a human check |
 | 4 SSH to cmd.exe | `test_ssh` 15/15 | works up to sshd; real sshd login is a human check |
 
 Human checks (cannot be tested on this PC without admin rights or a second PC):
-- Feature 2: transfers go through the hub, not literally PC to PC (the admin asked for "directly").
+- Feature 2: direct mode between two real PCs, with the real firewall rule (tests ran on 127.0.0.1 only).
 - Feature 3: trust on first use of the update key; one real exe update on an installed PC.
 - Feature 4: run `setup_ssh.ps1` on one PC (elevated), then one `ssh_run` from an admin PC.
 
@@ -34,7 +34,12 @@ Human checks (cannot be tested on this PC without admin rights or a second PC):
 
 ## Feature 2: file transfer
 
-- What: transfers go through the hub (upload, store, receiver downloads on its poll). Why: PCs only connect out to the hub today, with no firewall change on colleague PCs. Rejected: literal peer-to-peer, which needs an inbound port on every PC. Needs the admin's OK.
+- What (first version): transfers go through the hub (upload, store, receiver downloads on its poll). Why: PCs only connect out to the hub, with no firewall change on colleague PCs.
+- What (2026-11-16, the admin asked for direct mode): **direct first, hub relay as fallback.** Each PC with `"direct": true` runs a file server on port 8766. The hub gives the sender a ticket and the bytes go straight between the PCs. Why: the admin wants the files not to pass through the hub. Rejected: direct only, because a PC without the firewall rule, an offline PC, or a PC on another network could then get no files at all.
+- What: the ticket is HMAC-SHA256 over its claims (id, op, src, dst, name, size, sha256 or path, expiry 10 min), with the token of the PC that serves or takes the file. The PC checks it alone, takes each ticket once, and reports the result to the hub (audit). Why: only the hub and that PC know the token, so nobody else can make a ticket, and the PC needs no extra call to the hub. Rejected: the PC asking the hub for every request (one more round trip, and it fails when the hub is slow).
+- What: the firewall rule is for the agent exe only, port 8766, profiles Domain and Private, remote address LocalSubnet. `TeamA2A-Setup.exe` asks for admin rights once (UAC) and turns `direct` on only when the rule exists. Silent installs never show a UAC prompt. Why: without a rule, Windows shows a firewall pop-up on the colleague's screen when the agent opens the port; the plan says no pop-ups. Rejected: opening the port for all programs.
+- What: a PC cannot fetch files from another PC directly (`op: get` is for admins only); PCs can only send (`op: put`). Why: the same rule as the relay (only admins can request files from a PC).
+- What: the sender falls back to the relay only when there is no route (hub 409) or the PC does not answer in 5 s. A refusal by the PC (bad sha256, bad ticket) is an error, not a fallback. Why: a refusal means something is wrong, and a silent second try through the hub would hide it.
 - What: size limit `max_transfer_mb` (default 200), checked from Content-Length before the body is read. sha256 checked by the hub and again by the receiver. Sender and receiver must be approved PCs, or the sender is an admin. Rejected: checks on the receiver only.
 - What: admin MCP tools `send_file`, `fetch_file`, `list_transfers`. `fetch_file` saves to `~\a2a-inbox` by default and checks the sha256 again before it keeps the file. Why: the admin side must refuse a damaged file too. Rejected: saving first and checking after (a damaged file would stay on disk).
 - What: `fetch_file` may read any path the colleague's Windows user can read (A11). Why: admins already run full-permission Claude tasks on that PC, so a path limit adds no real protection. Rejected: only the work folder.

@@ -37,6 +37,7 @@ CONFIG_PATH = os.environ.get("A2A_HUB_CONFIG", os.path.join(HERE, "hub.json"))
 for _p in (HERE, os.path.join(os.path.dirname(HERE), "receiver")):
     if _p not in sys.path:
         sys.path.append(_p)
+import a2a_direct  # noqa: E402
 import a2a_sign  # noqa: E402
 import a2a_ssh  # noqa: E402
 from a2a_util import canonical, safe_name, version_tuple  # noqa: E402
@@ -159,9 +160,10 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(pcs_seen)").fetchall()}
-        if "ip" not in cols:  # hub.db from before the SSH feature
-            self.db.execute("ALTER TABLE pcs_seen ADD COLUMN ip TEXT")
-            self.db.commit()
+        for col, typ in (("ip", "TEXT"), ("direct_port", "INTEGER")):  # hub.db from an older version
+            if col not in cols:
+                self.db.execute(f"ALTER TABLE pcs_seen ADD COLUMN {col} {typ}")
+        self.db.commit()
         self.lock = threading.RLock()
         self.cond = threading.Condition(self.lock)
         self.audit_path = os.path.join(data_dir, "audit.jsonl")
@@ -193,6 +195,10 @@ class Store:
 
 
 # ---------------------------------------------------------------- hub logic
+
+class NoDirectRoute(Exception):
+    """The PC cannot be reached directly now (HTTP 409): the sender uses the hub relay."""
+
 
 class Hub:
     def __init__(self, cfg):
@@ -358,7 +364,7 @@ class Hub:
                 "running": len(run), "running_tasks": run,
                 "queued": queued.get(name, 0), "version": s.get("version"),
                 "role": pc.get("role", "user"), "approved": pc.get("approved", True),
-                "ip": s.get("ip"),
+                "ip": s.get("ip"), "direct_port": s.get("direct_port") or 0,
             })
         return out
 
@@ -429,13 +435,18 @@ class Hub:
         return {"broadcast_id": broadcast_id, "tasks": created}
 
     # ---- worker side
-    def seen(self, pc, busy_task=None, host=None, user=None, version=None, ip=None):
-        self.store.x("INSERT INTO pcs_seen(pc,last_seen,busy_task,host,user,version,ip) "
-                     "VALUES(?,?,?,?,?,?,?) ON CONFLICT(pc) DO UPDATE SET last_seen=excluded.last_seen,"
+    def seen(self, pc, busy_task=None, host=None, user=None, version=None, ip=None, direct_port=None):
+        if direct_port is not None:
+            try:
+                direct_port = max(0, min(65535, int(direct_port)))
+            except (TypeError, ValueError):
+                direct_port = None
+        self.store.x("INSERT INTO pcs_seen(pc,last_seen,busy_task,host,user,version,ip,direct_port) "
+                     "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(pc) DO UPDATE SET last_seen=excluded.last_seen,"
                      " busy_task=excluded.busy_task, host=COALESCE(excluded.host,host),"
                      " user=COALESCE(excluded.user,user), version=COALESCE(excluded.version,version),"
-                     " ip=COALESCE(excluded.ip,ip)",
-                     (pc, now(), busy_task, host, user, version, ip))
+                     " ip=COALESCE(excluded.ip,ip), direct_port=COALESCE(excluded.direct_port,direct_port)",
+                     (pc, now(), busy_task, host, user, version, ip, direct_port))
 
     def _claim(self, pc, slots=None, running=None):
         """Give the PC up to `slots` queued tasks (old receivers: running=None, at most 1).
@@ -764,14 +775,84 @@ class Hub:
                   "src": f["src"]} for f in files],
                 [{"id": r["id"], "path": r["path"], "name": r["name"]} for r in reqs])
 
+    def direct_route(self, pc):
+        """(ip, port) of a PC's direct file server, or raise NoDirectRoute."""
+        row = self.store.q("SELECT ip, direct_port, last_seen FROM pcs_seen WHERE pc=?", (pc,))
+        if not row or not row[0]["ip"] or not row[0]["direct_port"]:
+            raise NoDirectRoute(f"'{pc}' has no direct file transfer (use the hub relay)")
+        if not row[0]["last_seen"] or now() - row[0]["last_seen"] > ONLINE_S:
+            raise NoDirectRoute(f"'{pc}' is offline (use the hub relay; it gets the file later)")
+        return row[0]["ip"], int(row[0]["direct_port"])
+
+    def direct_transfer(self, actor, src, body):
+        """Plan a direct transfer and return a signed ticket for it. src: 'admin:NAME' or 'pc:NAME'.
+        op 'put': src sends `name` to PC `to`. op 'get' (admins only): src fetches `path` from PC `pc`."""
+        op = body.get("op") or "put"
+        tid = uuid.uuid4().hex[:12]
+        exp = now() + a2a_direct.TICKET_S
+        if op == "put":
+            to = str(body.get("to") or "")
+            self.check_pc_target(to)
+            if src == f"pc:{to}":
+                raise ValueError("a PC cannot send a file to itself")
+            name = safe_name(str(body.get("name") or ""))
+            try:
+                size = int(body.get("size"))
+            except (TypeError, ValueError):
+                raise ValueError("give the file 'size' in bytes")
+            if size < 0:
+                raise ValueError("bad size")
+            if size > self.max_transfer_bytes():
+                raise ValueError(f"file is larger than the hub limit ({self.cfg.get('max_transfer_mb', 200)} MB)")
+            sha = str(body.get("sha256") or "").strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", sha):
+                raise ValueError("give the file 'sha256' (hex)")
+            ip, port = self.direct_route(to)
+            dst, host_pc = f"pc:{to}", to
+            self.new_transfer(src, dst, name, size, sha, "direct", tid=tid)
+            claims = {"id": tid, "op": "put", "src": src, "dst": dst, "name": name, "size": size,
+                      "sha256": sha, "exp": exp}
+        elif op == "get":
+            if not src.startswith("admin:"):
+                raise PermissionError("only admins can fetch files from a PC")
+            pc = str(body.get("pc") or "")
+            self.check_pc_target(pc)
+            path = str(body.get("path") or "").strip()
+            if not path:
+                raise ValueError("give the 'path' of the file on the PC")
+            name = safe_name(ntpath.basename(path.rstrip("\\/")))
+            ip, port = self.direct_route(pc)
+            dst, host_pc = src, pc
+            self.new_transfer(f"pc:{pc}", dst, name, None, None, "direct_get", path, tid=tid)
+            claims = {"id": tid, "op": "get", "src": f"pc:{pc}", "dst": dst, "path": path, "exp": exp}
+        else:
+            raise ValueError("op must be 'put' or 'get'")
+        ticket = a2a_direct.make_ticket(self.cfg["pcs"][host_pc]["token"], claims)
+        host = f"[{ip}]" if ":" in ip else ip
+        self.store.audit(actor, "transfer_direct", {k: v for k, v in claims.items() if k != "exp"})
+        return {"transfer_id": tid, "url": f"http://{host}:{port}/a2a/files/{tid}", "ticket": ticket,
+                "expires": iso(exp)}
+
     def ack_file(self, pc, tid, ok, sha256=None, error=None):
         t = self.transfer(tid)
-        if t["dst"] == f"pc:{pc}" and t["status"] in ("stored", "offered"):
+        if t["src"] == f"pc:{pc}" and t["status"] == "direct_get":
+            if ok:
+                self.set_transfer(tid, status="delivered", sha256=sha256, error=None)
+                self.store.audit(pc, "transfer_delivered", {"transfer_id": tid, "name": t["name"], "src": t["src"],
+                                                            "dst": t["dst"], "mode": "direct"})
+            else:
+                err = str(error or "the PC could not send the file")[:2000]
+                self.set_transfer(tid, status="failed", error=err)
+                self.store.audit(pc, "transfer_failed", {"transfer_id": tid, "error": err, "mode": "direct"})
+            self.store.notify()
+            return {"ok": True}
+        if t["dst"] == f"pc:{pc}" and t["status"] in ("stored", "offered", "direct"):
             if ok and (not sha256 or str(sha256).lower() == t["sha256"]):
                 self.set_transfer(tid, status="delivered", error=None)
                 self._drop_file(tid)
                 self.store.audit(pc, "transfer_delivered", {"transfer_id": tid, "name": t["name"],
-                                                            "src": t["src"], "dst": t["dst"]})
+                                                            "src": t["src"], "dst": t["dst"],
+                                                            "mode": "direct" if t["status"] == "direct" else "hub"})
             else:
                 err = str(error or "receiver refused the file (sha256 mismatch)")[:2000]
                 self.set_transfer(tid, status="failed", error=err)
@@ -906,6 +987,13 @@ class Hub:
             self.store.x("UPDATE tasks SET status='failed', error='no result from receiver (timeout)', "
                          "finished=? WHERE id=?", (now(), r["id"]))
             self.store.audit("hub", "timeout", {"task_id": r["id"], "pc": r["pc"]})
+        # Direct transfers whose ticket ran out without a result from the PC.
+        rows = self.store.q("SELECT id FROM transfers WHERE status IN ('direct','direct_get') AND created<?",
+                            (now() - a2a_direct.TICKET_S - 300,))
+        for r in rows:
+            self.set_transfer(r["id"], status="failed", error="direct transfer did not finish")
+            self.store.audit("hub", "transfer_failed", {"transfer_id": r["id"], "mode": "direct",
+                                                        "error": "direct transfer did not finish"})
         # Transfers nobody finished in time: expire them and free the disk.
         old = now() - float(self.cfg.get("transfer_ttl_h", 24)) * 3600
         rows = self.store.q("SELECT id FROM transfers WHERE status NOT IN ('delivered','failed','expired') "
@@ -1118,7 +1206,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not pc:
                     return
                 body = self._body() if method == "POST" else {}
-                info = {k: body.get(k) for k in ("host", "user", "version")}
+                info = {k: body.get(k) for k in ("host", "user", "version", "direct_port")}
                 info["ip"] = self.client_address[0]
                 if p == "/api/worker/next" and method == "POST":
                     wait = min(float(body.get("wait", POLL_WAIT_S)), 60)
@@ -1134,6 +1222,15 @@ class Handler(BaseHTTPRequestHandler):
                     if slots is not None:
                         out["tasks"] = got["tasks"]
                     return self._send(200, out)
+                if p == "/api/worker/files/direct" and method == "POST":
+                    try:
+                        if h.role_of(pc) == "pending":
+                            raise PermissionError("PC waits for approval by the hub owner")
+                        return self._send(200, {"ok": True, **h.direct_transfer(pc, f"pc:{pc}", body)})
+                    except PermissionError as e:
+                        return self._send(403, {"ok": False, "error": str(e)})
+                    except NoDirectRoute as e:
+                        return self._send(409, {"ok": False, "error": str(e)})
                 if p.startswith("/api/worker/files/"):
                     parts = p.split("/")  # /api/worker/files/ID[/ack]
                     tid = unquote(parts[4]) if len(parts) > 4 else ""
@@ -1183,6 +1280,14 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if p == "/api/files" and method == "GET":
                     return self._send(200, {"ok": True, "transfers": h.transfers(qs.get("limit", 50))})
+                if p == "/api/files/direct" and method == "POST":
+                    try:
+                        return self._send(200, {"ok": True, **h.direct_transfer(admin, f"admin:{admin}",
+                                                                                self._body())})
+                    except PermissionError as e:
+                        return self._send(403, {"ok": False, "error": str(e)})
+                    except NoDirectRoute as e:
+                        return self._send(409, {"ok": False, "error": str(e)})
                 if p == "/api/files/request" and method == "POST":
                     b = self._body()
                     return self._send(200, {"ok": True, "transfer": h.request_file(

@@ -26,6 +26,7 @@ VERSION = "1.2"
 HERE = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.append(HERE)
+import a2a_direct  # noqa: E402
 import a2a_sign  # noqa: E402
 from a2a_util import canonical, safe_name, sha256_file, version_tuple  # noqa: E402
 
@@ -77,6 +78,10 @@ def load_config(path=None):
     cfg.setdefault("poll_wait_s", 20)
     cfg.setdefault("extra_system_prompt", "")
     cfg.setdefault("mcp_cmd", None)  # [exe, args...] of the admin MCP; set by the installer
+    # Direct file transfer: a small file server on direct_port. The installer turns it on after it
+    # made the firewall rule; without the rule other PCs cannot reach it (they use the hub relay).
+    cfg.setdefault("direct", False)
+    cfg.setdefault("direct_port", a2a_direct.DEFAULT_PORT)
     wd = cfg["workdir"] or os.path.expanduser("~")
     cfg["workdir"] = wd if os.path.isabs(wd) else os.path.join(HERE, wd)
     cfg["_path"] = os.path.abspath(path)
@@ -134,10 +139,33 @@ def upload_file(cfg, url_path, path, timeout=600):
             raise _hub_error(e)
 
 
+def hub_json(cfg, path, body, timeout=30):
+    req = urllib.request.Request(cfg["hub_url"] + path, data=json.dumps(body).encode("utf-8"), method="POST",
+                                 headers={"Content-Type": "application/json", "X-A2A-Token": cfg["token"]})
+    try:
+        with OPENER.open(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise _hub_error(e)
+
+
 def send_file(cfg, to, path):
+    """Send a file to another PC: straight to it when it can be reached, else through the hub."""
     name = os.path.basename(path)
     safe_name(name)
-    return upload_file(cfg, f"/api/worker/files/send?to={quote(to)}&name={quote(name)}", path)
+    size, digest = os.path.getsize(path), sha256_file(path)
+    try:
+        d = hub_json(cfg, "/api/worker/files/direct",
+                     {"op": "put", "to": to, "name": name, "size": size, "sha256": digest})
+        a2a_direct.put_file(d["url"], d["ticket"], path)
+        return {"transfer_id": d["transfer_id"], "mode": "direct"}
+    except HubError as e:
+        if e.code != 409:  # 409 = no direct route to that PC; anything else is a real refusal
+            raise
+    except a2a_direct.Unreachable:
+        pass
+    r = upload_file(cfg, f"/api/worker/files/send?to={quote(to)}&name={quote(name)}", path)
+    return {**r, "mode": "hub"}
 
 
 def unique_path(folder, name):
@@ -655,7 +683,35 @@ class Receiver:
             self.update_wake.clear()
 
     # ---- main loop
+    # ---- direct file transfer (bytes straight from the sender; the hub signs a ticket)
+    def start_direct(self):
+        self.direct = None
+        self.info["direct_port"] = 0  # 0 = no direct route: senders use the hub relay
+        if not self.cfg.get("direct"):
+            return
+        try:
+            self.direct = a2a_direct.DirectServer(
+                self.cfg["name"], self.cfg["token"], self.cfg["workdir"], self.direct_report, log,
+                bind=self.cfg.get("direct_bind", "0.0.0.0"), port=self.cfg["direct_port"]).start()
+            self.info["direct_port"] = self.direct.port
+            log({"event": "direct_on", "port": self.direct.port})
+        except OSError as e:
+            log({"event": "direct_error", "error": f"cannot listen on port {self.cfg['direct_port']}: {e}"})
+
+    def direct_report(self, tid, ok, sha256=None, error=None):
+        for _ in range(5):
+            try:
+                return self.ack(tid, ok, sha256=sha256, error=error)
+            except HubError as e:
+                if e.code in (400, 401, 403, 404):
+                    log({"event": "direct_ack_refused", "transfer_id": tid, "error": str(e)})
+                    return None
+            except Exception as e:
+                log({"event": "direct_ack_retry", "transfer_id": tid, "error": str(e)})
+            self.stop.wait(2)
+
     def loop(self):
+        self.start_direct()
         log({"event": "online", "hub": self.cfg["hub_url"], "name": self.cfg["name"],
              "version": self.version, "max_parallel": self.max_parallel})
         if self.cfg.get("auto_update", True):
@@ -722,9 +778,11 @@ def main(argv=None):
     if args.cmd == "send-file":
         try:
             r = send_file(cfg, args.to, args.path)
-        except (HubError, OSError, ValueError, urllib.error.URLError) as e:
+        except (HubError, OSError, ValueError, RuntimeError, urllib.error.URLError) as e:
             print(f"send-file failed: {e}", file=sys.stderr)
             return 1
+        print("sent straight to the PC" if r.get("mode") == "direct"
+              else "sent through the hub (the PC gets it when it polls)", file=sys.stderr)
         print(r.get("transfer_id"))
         return 0
     rcv = Receiver(cfg)

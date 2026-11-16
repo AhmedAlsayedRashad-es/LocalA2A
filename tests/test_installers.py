@@ -92,6 +92,11 @@ class Installers(unittest.TestCase):
         inst.step_config(hub_url, name, token, "claude", pubkey)
         with open(os.path.join(setup.APP_DIR, "receiver.json"), encoding="utf-8") as f:
             self.assertEqual(json.load(f)["update_pubkey"], pubkey)
+        if not setup.is_admin():  # no UAC prompt in a test: without the firewall rule direct mode stays off
+            self.assertFalse(inst.step_direct(ask=False))
+            with open(os.path.join(setup.APP_DIR, "receiver.json"), encoding="utf-8") as f:
+                cfgd = json.load(f)
+            self.assertEqual((cfgd["direct"], cfgd["direct_port"]), (False, 8766))
         self.assertEqual(http("POST", "/api/send", {"to": "testpc", "message": "x"})[0], 400)  # pending
         self.assertEqual(http("POST", "/api/pcs/testpc/approve", {})[0], 200)
         # a second run keeps the same membership

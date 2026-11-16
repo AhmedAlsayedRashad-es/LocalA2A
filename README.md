@@ -89,7 +89,18 @@ Ask your Claude, for example: "Ask group:revit which Revit versions are installe
 
 ## File transfer
 
-Files go through the hub (PCs only connect out to the hub; no port opens on colleague PCs).
+**Direct mode (default when possible):** the bytes go straight from the sender to the PC, not through the hub.
+The hub only checks who may send what, gives the sender a ticket for 10 minutes (signed with the token of the PC
+that takes or serves the file, so only that PC accepts it, and only once), and writes the audit log
+(`transfer_direct`, then `transfer_delivered` / `transfer_failed` with `mode: direct`).
+
+- Each PC runs a small file server on port 8766 (`direct_port`) when `"direct": true` is in its receiver.json.
+  `TeamA2A-Setup.exe` asks once for admin rights to add the firewall rule "TeamA2A Direct" (the agent only,
+  port 8766, local network only) and turns `direct` on only when the rule exists. Silent installs add the rule
+  only when run elevated (`--no-direct` to skip). Script installs: add the rule by hand and set `"direct": true`.
+- **Hub relay (fallback):** when the PC has no direct port, is offline, or does not answer in 5 s, the file goes
+  through the hub as before (no port needed on the PC; offline PCs get it later). The tool output says which way
+  the file went.
 
 - Admin to PC: MCP `send_file {to, path}`. The file arrives in `<workdir>\a2a-inbox` on that PC
   (`name (2).ext` when the name exists).
@@ -100,7 +111,8 @@ Files go through the hub (PCs only connect out to the hub; no port opens on coll
   the hub and again by the receiver, plain file names only, sender and receiver must be approved. Files nobody
   fetched expire after `transfer_ttl_h` (default 24) and are deleted. Every step is in the audit log
   (`transfer_upload`, `transfer_delivered`, `transfer_rejected`, `transfer_failed`, `transfer_expired`).
-- MCP `list_transfers` shows the status: `stored` / `offered` (waits for the PC), `delivered`, `failed`, `expired`.
+- MCP `list_transfers` shows the status: `direct` / `direct_get` (direct, running), `stored` / `offered` (relay,
+  waits for the PC), `delivered`, `failed`, `expired`.
 
 ## Signed updates of the receiver
 

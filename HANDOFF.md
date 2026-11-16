@@ -16,6 +16,7 @@ Plan: [PLAN-FEATURES.md](PLAN-FEATURES.md). Decisions and test evidence: [DECISI
 | 1A-15 README | done | sections for all four features |
 | Plan 4.1 feature 4 (SSH) | done | `test_ssh` 15/15 OK |
 | 1A-16 full run + DECISIONS summary | done | 70 tests OK |
+| Direct file transfer (admin asked, 2026-11-16) | done | `test_direct` 9/9; full suite 79 tests OK |
 
 ## Run the tests
 
@@ -24,7 +25,9 @@ Plan: [PLAN-FEATURES.md](PLAN-FEATURES.md). Decisions and test evidence: [DECISI
 
 ## Human checks before you merge
 
-1. File transfer goes through the hub, not straight from PC to PC. Approve this, or ask for a direct mode.
+1. Direct file transfer (the admin asked for it): install the new `TeamA2A-Setup.exe` on two PCs, say Yes to the
+   admin prompt, then `send_file` between them and check that the output says "straight to". Tested here only on
+   one PC (127.0.0.1); a real LAN and the real firewall rule are not tested.
 2. Updates: PCs trust the hub's update key the first time they join. Then make one real release
    (`hub.py release`, with `TeamA2A-Agent.exe` in the source folder) and watch one installed PC update and restart.
    PCs installed before this branch have no `update_pubkey`; run the new `TeamA2A-Setup.exe` on them once

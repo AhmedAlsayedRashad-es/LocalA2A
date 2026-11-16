@@ -4,7 +4,9 @@ Env:  A2A_HUB_URL (default http://127.0.0.1:8765), A2A_ADMIN_TOKEN (from `python
 Python 3.8+, standard library only.
 """
 import hashlib
+import http.client
 import json
+import ntpath
 import os
 import shutil
 import subprocess
@@ -12,7 +14,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
+
+DIRECT_CONNECT_S = float(os.environ.get("A2A_DIRECT_CONNECT_S", "5"))  # then fall back to the hub relay
 
 def _installed():
     """The PC's own receiver.json (installed by TeamA2A-Setup). Its token works here once the
@@ -198,6 +202,67 @@ def _fmt_transfer(t):
     return s
 
 
+# ---- direct mode: the hub signs a ticket, the bytes go straight between this PC and the colleague PC
+class _NoDirect(Exception):
+    """No direct route now: use the hub relay."""
+
+
+def _direct_ticket(body):
+    """Ask the hub for a direct-transfer ticket. Raises _NoDirect when the PC cannot be reached directly."""
+    req = urllib.request.Request(HUB + "/api/files/direct", data=json.dumps(body).encode("utf-8"),
+                                 method="POST", headers={"Content-Type": "application/json", "X-A2A-Token": TOKEN})
+    try:
+        with OPENER.open(req, timeout=30) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 409):  # 404: an older hub without direct mode
+            raise _NoDirect(str(e))
+        raise _http_error(e)
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"cannot reach the hub at {HUB}: {e.reason}")
+
+
+def _direct_conn(url):
+    u = urlparse(url)
+    try:
+        conn = http.client.HTTPConnection(u.hostname, u.port, timeout=DIRECT_CONNECT_S)
+        conn.connect()
+    except OSError as e:
+        raise _NoDirect(f"{u.hostname}:{u.port} did not answer: {e}")
+    conn.sock.settimeout(600)
+    return conn, u.path
+
+
+def _direct_error(r):
+    try:
+        return json.loads(r.read().decode("utf-8")).get("error")
+    except Exception:
+        return f"HTTP {r.status}"
+
+
+def _direct_put(path, to, size, digest):
+    d = _direct_ticket({"op": "put", "to": to, "name": os.path.basename(path), "size": size, "sha256": digest})
+    conn, upath = _direct_conn(d["url"])
+    try:
+        conn.putrequest("PUT", upath)
+        conn.putheader("X-A2A-Ticket", d["ticket"])
+        conn.putheader("Content-Type", "application/octet-stream")
+        conn.putheader("Content-Length", str(size))
+        conn.endheaders()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(CHUNK), b""):
+                conn.send(chunk)
+        r = conn.getresponse()
+        if r.status != 200:
+            raise RuntimeError(f"{to} refused the file: {_direct_error(r)}")
+        r.read()
+    except OSError as e:
+        raise RuntimeError(f"direct upload to {to} broke off: {e}")
+    finally:
+        conn.close()
+    return d["transfer_id"]
+
+
 def t_send_file(a):
     path = os.path.abspath(os.path.expanduser(str(a.get("path") or "")))
     if not os.path.isfile(path):
@@ -206,6 +271,14 @@ def t_send_file(a):
     if not to:
         raise RuntimeError("give 'to' (the PC name)")
     size, digest = os.path.getsize(path), _sha256_file(path)
+    note = ""
+    try:
+        tid = _direct_put(path, to, size, digest)
+        t = _wait_transfer(tid, 15, ("delivered",))
+        return (f"Sent {size} bytes straight to {to} (direct, sha256 {digest}). "
+                f"It is in the a2a-inbox folder on {to}.\n" + _fmt_transfer(t))
+    except _NoDirect as e:
+        note = f" (direct not possible: {e}; sent through the hub)"
     url = f"{HUB}/api/files/send?to={quote(to)}&name={quote(os.path.basename(path))}"
     with open(path, "rb") as f:
         req = urllib.request.Request(url, data=f, method="POST", headers={
@@ -219,7 +292,7 @@ def t_send_file(a):
         except urllib.error.URLError as e:
             raise RuntimeError(f"cannot reach the hub at {HUB}: {e.reason}")
     t = _wait_transfer(tid, a.get("wait_seconds", 60), ("delivered",))
-    head = f"Uploaded {size} bytes (sha256 {digest})."
+    head = f"Uploaded {size} bytes to the hub (sha256 {digest}){note}."
     if t["status"] not in TRANSFER_FINAL:
         head += f" Not delivered yet: {to} gets it when it polls the hub (see list_transfers)."
     elif t["status"] == "delivered":
@@ -251,6 +324,10 @@ def t_fetch_file(a):
     pc, path = str(a.get("pc") or "").strip(), str(a.get("path") or "").strip()
     if not pc or not path:
         raise RuntimeError("give 'pc' and 'path'")
+    try:
+        return _direct_get(pc, path, a.get("save_to"))
+    except _NoDirect:
+        pass  # through the hub
     t = hub("POST", "/api/files/request", {"pc": pc, "path": path})["transfer"]
     t = _wait_transfer(t["id"], a.get("wait_seconds", 120), ("stored",))
     if t["status"] != "stored":
@@ -283,6 +360,42 @@ def t_fetch_file(a):
         raise RuntimeError("sha256 mismatch: the file was damaged on the way; nothing was saved")
     os.replace(part, dest)
     return f"Saved {size} bytes from {pc}:{path} to {dest} (sha256 {t['sha256']})."
+
+
+def _direct_get(pc, path, save_to):
+    d = _direct_ticket({"op": "get", "pc": pc, "path": path})
+    conn, upath = _direct_conn(d["url"])
+    try:
+        conn.putrequest("GET", upath)
+        conn.putheader("X-A2A-Ticket", d["ticket"])
+        conn.endheaders()
+        r = conn.getresponse()
+        if r.status != 200:
+            err = _direct_error(r)
+            return f"The file did not come (direct from {pc}): {err}"
+        want = (r.getheader("X-A2A-SHA256") or "").lower()
+        name = unquote(r.getheader("X-A2A-Name") or "") or ntpath.basename(path.rstrip("\\/"))
+        dest = _save_path(save_to, os.path.basename(name))
+        part = dest + ".part"
+        h, size = hashlib.sha256(), 0
+        try:
+            with open(part, "wb") as out:
+                for chunk in iter(lambda: r.read(CHUNK), b""):
+                    h.update(chunk)
+                    out.write(chunk)
+                    size += len(chunk)
+        except Exception:
+            _unlink(part)
+            raise
+    except OSError as e:
+        raise RuntimeError(f"direct download from {pc} broke off: {e}")
+    finally:
+        conn.close()
+    if h.hexdigest() != want:
+        _unlink(part)
+        raise RuntimeError("sha256 mismatch: the file was damaged on the way; nothing was saved")
+    os.replace(part, dest)
+    return f"Saved {size} bytes from {pc}:{path} to {dest} (direct, sha256 {want})."
 
 
 def _unlink(path):
@@ -393,16 +506,18 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"task_id": {"type": "string"}},
                      "required": ["task_id"]}},
     {"name": "send_file", "fn": t_send_file,
-     "description": ("Send a file from this PC to a colleague PC through the hub. It arrives in the "
-                     "a2a-inbox folder of the PC's work folder. The hub checks size and sha256."),
+     "description": ("Send a file from this PC to a colleague PC. It goes straight to the PC when the PC can "
+                     "be reached (direct mode), else through the hub. It arrives in the a2a-inbox folder of "
+                     "the PC's work folder. Size and sha256 are checked."),
      "inputSchema": {"type": "object", "properties": {
          "to": {"type": "string", "description": "PC name on the hub."},
          "path": {"type": "string", "description": "Path of the file on this PC."},
          "wait_seconds": {"type": "number", "description": "Wait this long for delivery (default 60)."}},
          "required": ["to", "path"]}},
     {"name": "fetch_file", "fn": t_fetch_file,
-     "description": ("Get a file from a colleague PC through the hub. The PC uploads it when it polls; "
-                     "the file is saved here (default: ~/a2a-inbox)."),
+     "description": ("Get a file from a colleague PC: straight from the PC when it can be reached (direct "
+                     "mode), else through the hub (the PC uploads it when it polls). The file is saved here "
+                     "(default: ~/a2a-inbox)."),
      "inputSchema": {"type": "object", "properties": {
          "pc": {"type": "string", "description": "PC name on the hub."},
          "path": {"type": "string", "description": "Path of the file on that PC (relative = its work folder)."},
